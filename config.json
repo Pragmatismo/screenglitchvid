@@ -87,5 +87,6 @@
   "debug_overlay": true,
   "save_frames_dir": "frames",
   "auto_reseed_threshold": 0.985,
-  "initial_seed_cells": 400
+  "initial_seed_cells": 400,
+  "fade_revert_rate": 0.2
 }

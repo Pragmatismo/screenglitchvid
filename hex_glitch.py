@@ -11,6 +11,8 @@ import math
 import random
 import time
 import subprocess
+import json
+import copy
 from typing import Tuple, Dict, List, Optional, Iterable, Set
 
 import pygame
@@ -21,7 +23,7 @@ except Exception:
     PIL_AVAILABLE = False
 
 # --------------------------- CONFIG ---------------------------
-CONFIG: Dict = {
+DEFAULT_CONFIG: Dict = {
     # Canvas / grid
     "width": 2280,
     "height": 1720,
@@ -150,6 +152,51 @@ CONFIG: Dict = {
     "initial_seed_cells": 400
 }
 # --------------------------------------------------------------
+
+
+def _coerce_config_value(value, default):
+    """Best-effort coercion of JSON-loaded values to match defaults."""
+
+    if isinstance(default, tuple):
+        if isinstance(value, list):
+            return tuple(value)
+        return tuple(value) if not isinstance(value, tuple) else value
+    if isinstance(default, list):
+        if isinstance(value, list):
+            if default and isinstance(default[0], tuple):
+                return [tuple(item) if isinstance(item, list) else item for item in value]
+            return value
+        return default
+    if isinstance(default, dict) and isinstance(value, dict):
+        coerced = default.copy()
+        for key, sub_value in value.items():
+            if key in default:
+                coerced[key] = _coerce_config_value(sub_value, default[key])
+            else:
+                coerced[key] = sub_value
+        return coerced
+    return value
+
+
+def load_config(path: str) -> Dict:
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            user_config = json.load(f)
+        for key, value in user_config.items():
+            if key in config:
+                config[key] = _coerce_config_value(value, config[key])
+            else:
+                config[key] = value
+    except FileNotFoundError:
+        pass
+    except json.JSONDecodeError as exc:
+        print(f"Warning: Failed to parse config file {path}: {exc}")
+    return config
+
+
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+CONFIG: Dict = load_config(CONFIG_PATH)
 
 HEX_DIRS = [(1,0),(1,-1),(0,-1),(-1,0),(-1,1),(0,1)]
 

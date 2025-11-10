@@ -149,7 +149,10 @@ DEFAULT_CONFIG: Dict = {
     "debug_overlay": True,
     "save_frames_dir": "frames",
     "auto_reseed_threshold": 0.985,
-    "initial_seed_cells": 400
+    "initial_seed_cells": 400,
+
+    # Fading
+    "fade_revert_rate": 0.2,
 }
 # --------------------------------------------------------------
 
@@ -203,6 +206,17 @@ HEX_DIRS = [(1,0),(1,-1),(0,-1),(-1,0),(-1,1),(0,1)]
 # --------------------- Mouse-target toggle --------------------
 MOUSE_TARGET_MODE = True  # F9 toggles this at runtime
 
+# --------------------- Fade mode toggle -----------------------
+FADE_MODES = ("none", "blank", "image")
+
+
+def describe_fade_mode(mode: str) -> str:
+    if mode == "blank":
+        return "Blank"
+    if mode == "image":
+        return "Image"
+    return "Off"
+
 def pick_anchor_axial(cols: int, rows: int, hex_radius: float, origin, use_mouse: bool):
     """Return (q,r) from mouse if enabled & inside window; else random."""
     import pygame
@@ -242,6 +256,7 @@ def _draw_help_overlay(screen, width, height, font_name=None):
             ("F5", "PNG sequence on/off"),
             ("F6", "Start/stop ffmpeg writer"),
             ("F9", "Toggle mouse-target mode ON/OFF"),
+            ("F10", "Cycle fade mode (Off → Blank → Image)"),
         ]),
         ("Images / Text", [
             ("I", "Overlay image 100%"),
@@ -770,11 +785,32 @@ def main():
     image_idx = 0
     if image_list: grid.fill_from_image(image_list[0], CONFIG["image_gamma"])
 
+    image_cache: Dict[str, Optional[List[List[Tuple[int, int, int]]]]] = {}
+
+    def get_image_target(path: str) -> Optional[List[List[Tuple[int, int, int]]]]:
+        if not path:
+            return None
+        if path not in image_cache:
+            img = load_image_resized(path, cols, rows, CONFIG["image_gamma"])
+            if img is None:
+                image_cache[path] = None
+            else:
+                px = img.load()
+                data: List[List[Tuple[int, int, int]]] = []
+                for r in range(rows):
+                    row_vals: List[Tuple[int, int, int]] = []
+                    for q in range(cols):
+                        row_vals.append(tuple(px[q, r]))
+                    data.append(row_vals)
+                image_cache[path] = data
+        return image_cache[path]
+
     paused = False
     debug = CONFIG["debug_overlay"]
     show_grid = CONFIG["show_grid_lines"]
     help_visible = False
     mouse_target_mode = True   # F9 toggles this
+    fade_mode_index = 0        # F10 cycles this
 
     text_mode = False; words: List[str] = []; word_index = 0; next_word_at = 0
 
@@ -865,6 +901,17 @@ def main():
                 elif event.key == pygame.K_F9:
                     mouse_target_mode = not mouse_target_mode
                     print(f"[UI] Mouse-target mode: {'ON' if mouse_target_mode else 'OFF'}")
+                elif event.key == pygame.K_F10:
+                    for _ in range(len(FADE_MODES)):
+                        fade_mode_index = (fade_mode_index + 1) % len(FADE_MODES)
+                        candidate = FADE_MODES[fade_mode_index]
+                        if candidate != "image" or image_list:
+                            break
+                    mode = FADE_MODES[fade_mode_index]
+                    if mode == "image" and not get_image_target(image_list[image_idx]):
+                        print("[UI] Fade mode: Image (unavailable - missing image data)")
+                    else:
+                        print(f"[UI] Fade mode: {describe_fade_mode(mode)}")
 
                 elif event.key == pygame.K_r:
                     for rr in range(rows):
@@ -1096,6 +1143,28 @@ def main():
                         if 0 <= tq < cols and 0 <= tr < rows:
                             base = grid.get(tq, tr); grid.set(tq, tr, lerp_color(base, scol, fade))
 
+        if not paused:
+            fade_mode = FADE_MODES[fade_mode_index]
+            fade_rate = clamp(float(CONFIG.get("fade_revert_rate", 0.2)), 0.0, 1.0)
+            if fade_rate > 0.0 and fade_mode != "none":
+                if fade_mode == "blank":
+                    target = CONFIG["base_color"]
+                    for r in range(rows):
+                        for q in range(cols):
+                            current = grid.get(q, r)
+                            if current != target:
+                                grid.set(q, r, lerp_color(current, target, fade_rate))
+                elif fade_mode == "image" and image_list:
+                    target_data = get_image_target(image_list[image_idx])
+                    if target_data is not None:
+                        for r in range(rows):
+                            row_target = target_data[r]
+                            for q in range(cols):
+                                target = row_target[q]
+                                current = grid.get(q, r)
+                                if current != target:
+                                    grid.set(q, r, lerp_color(current, target, fade_rate))
+
         # Draw
         screen.fill((0, 0, 0))
         side = hex_radius - 0.7
@@ -1138,7 +1207,11 @@ def main():
             rec = []
             if record_png: rec.append("PNG")
             if ffmpeg_proc is not None: rec.append("FFMPEG")
-            txt = f"FPS:{fps:5.1f}  MT:{'ON' if mouse_target_mode else 'OFF'}"
+            fade_mode = FADE_MODES[fade_mode_index]
+            fade_desc = describe_fade_mode(fade_mode)
+            if fade_mode == "image" and image_list and get_image_target(image_list[image_idx]) is None:
+                fade_desc += "*"
+            txt = f"FPS:{fps:5.1f}  MT:{'ON' if mouse_target_mode else 'OFF'}  FD:{fade_desc}"
             if rec: txt += " REC[" + "+".join(rec) + "]"
             pygame.display.get_surface().blit(pygame.font.SysFont("monospace", 14).render(txt, True, (230, 230, 235)), (12, 10))
 

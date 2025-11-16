@@ -1,153 +1,133 @@
-# 🌀 Hex Glitch
-### Generative glitch-visual tool for music videos and sci-fi overlays
-**by [Jumble Sale of Stimuli](https://www.youtube.com/@JumbleSaleOfStimuli)**  
-**Repository:** [Pragmatismo/screenglitchvid](https://github.com/Pragmatismo/screenglitchvid)  
-**Created with ChatGPT-5 · Open Source**
+# 🎛️ ScreenGlitchVid Toolbox
+
+ScreenGlitchVid is evolving from a single-purpose glitch visualizer into a toolbox of creative helpers that share
+projects, assets, and settings.  The new launcher provides a home base for organising work, spinning up placeholder
+analysis tools, and jumping into production-ready video utilities like Hex Glitch.
 
 ---
 
-## ✨ Overview
-
-**Hex Glitch** (`hex_glitch.py`) is a real-time **generative art** program that paints and mutates color fields across a hexagonal grid, creating continuously evolving glitch patterns.
-
-It’s designed for producing **short video clips or live overlays** — ideal for use in **sci-fi music videos**, **projection art**, or **VJ loops**.
-
-Features include:
-
-- Real-time animation in `pygame`
-- Dozens of reactive visual effects (waves, quakes, divides, halos, etc.)
-- Word and image compositing
-- PNG sequence or live FFmpeg recording to MP4
-- On-screen help (F2) and mouse-target toggle (F9)
-- Fully open-source and editable
-
----
-
-## 🧰 Installation (Linux)
-
-You’ll need **Python 3.10+** and `venv` (included with Python).
+## 🚀 Quick start
 
 ```bash
 # 1. Clone the repository
 git clone https://github.com/Pragmatismo/screenglitchvid.git
 cd screenglitchvid
 
-# 2. Create and activate a virtual environment
+# 2. Create and activate a virtual environment (optional but recommended)
 python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activate  # Windows: venv\\Scripts\\activate
 
 # 3. Install dependencies
 pip install pygame pillow
 ```
 
----
-
-## ▶️ Running
+### Launch the toolbox menu
 
 ```bash
-python3 hex_glitch.py
+python main_menu.py
 ```
 
-A window will open showing the animated hex grid.  
-Press **F2** for an on-screen list of all key controls.
+From here you can select/create projects, review their asset folders, and launch individual tools with a single click.
+Each tool exposes a “Use project settings” toggle: when enabled the launcher injects project-specific config files and
+output directories so clips, timing charts, and derived assets stay sandboxed.
+
+### Run tools directly (optional)
+All tools remain runnable as standalone scripts.  For example:
+
+```bash
+python tools/video/hex_glitch/hex_glitch.py --config tools/video/hex_glitch/config.json
+```
+
+Supply `--output-dir` to override recording/screenshot folders when working outside the menu.
 
 ---
 
-## 🎹 Key Controls
+## 🗂️ Project structure
+
+```
+screenglitchvid/
+├── assets/
+│   └── projects/
+│       └── <project>/
+│           ├── assets/          # user-imported media (audio, images, clips, etc.)
+│           └── internal/
+│               ├── timing/      # analysis outputs (BPM maps, marker JSON, ...)
+│               └── video/
+│                   └── hex_glitch/   # per-project configs + renders for Hex Glitch
+├── data/
+│   └── projects.json           # registered projects + last selection
+├── tools/
+│   ├── analysis/...
+│   └── video/...
+└── main_menu.py
+```
+
+The launcher persists project metadata in `data/projects.json` and scaffolds folders on demand.  Shared helper code lives
+in `app_core/` (project management + future settings helpers).
+
+---
+
+## 🛠️ Available tools
+
+### Analysis — Create Basic Audio Map (placeholder)
+*Path:* `tools/analysis/create_basic_audio_map/tool.py`
+
+This lightweight Tkinter UI (currently a “Work in progress” window) represents the forthcoming audio-analysis pipeline
+that will ingest songs, detect BPM/downbeats, and export marker files to each project’s `internal/timing` folder.  Even in
+placeholder form it already accepts the project context passed by the main menu so it knows which workspace it will target.
+
+### Video — Hex Glitch
+*Path:* `tools/video/hex_glitch/hex_glitch.py`
+
+Hex Glitch is the original generative glitch-visual tool by **Jumble Sale of Stimuli**.  It paints and mutates colour
+fields across a hexagon grid using dozens of propagation modes, overlays, and recording workflows.
+
+When launched from the menu with project settings enabled the tool automatically:
+- Loads the project-specific config file in `internal/video/hex_glitch/config.json` (created on demand).
+- Redirects PNG/FFmpeg output to the same folder so renders stay grouped with the project.
+- Resolves relative asset paths (images, `vidtext` word lists, etc.) relative to the chosen config file.
+
+You can still run it directly for experiments by choosing a config and optional output directory via CLI flags.
+
+#### Controls recap
 
 | Key | Action |
 |-----|--------|
 | **Space** | Pause / resume animation |
-| **R** | Reset grid and reseed random colors |
+| **R** | Reset grid and reseed random colours |
 | **F2** | Show / hide help overlay |
 | **F3** | Toggle debug info (FPS, record status) |
-| **F4** | Save screenshot (`frames/`) |
-| **F5** | Toggle PNG sequence capture (`frames_out/`) |
+| **F4** | Save screenshot (`save_frames_dir`) |
+| **F5** | Toggle PNG sequence capture (`record_dir`) |
 | **F6** | Start / stop live FFmpeg MP4 recording |
-| **F9** | Toggle *Mouse-target mode* (affects Grow, Halo, Erupt, Divide, Fuse) |
+| **F9** | Toggle mouse-target mode |
 | **I / O / P** | Overlay current / half-opacity / next image |
-| **T** | Read and stamp words from `vidtext.txt` |
-| **Y / U** | Full / half-opacity color wash from random edge |
+| **T** | Stamp words from the configured words file |
+| **Y / U** | Full / half-opacity colour wash from random edge |
 | **;** | Fire a dashed “edge shot” line |
 | **Q / W / E** | Quake • Waves • Erupt |
 | **G / H** | Grow • Halo |
 | **A / S** | Align • Scatter |
 | **D / F** | Divide • Fuse |
 | **J / K / L** | Jump • Kick • Leap |
-| **Mouse click** | Paint random color at cursor |
+| **Mouse click** | Paint random colour at cursor |
 | **Esc** | Quit program |
 
----
+#### Recording workflows
+- **PNG sequence** — press **F5** to dump frames to the configured `record_dir`.
+- **FFmpeg MP4** — press **F6** to stream frames into FFmpeg with the quality/fps options specified in your config.
+  Playback is typically faster than the live preview, so retime clips in your editor to taste.
 
-## 🎬 Recording and Output
-
-There are two recording modes:
-
-- **PNG Sequence:**  
-  Press **F5** — each frame is saved as a numbered PNG in `frames_out/`.
-
-- **FFmpeg MP4:**  
-  Press **F6** — live stream frames to FFmpeg, producing a compressed video file.
-
-### ⚡ Playback Speed
-Recorded videos will likely **play faster than the live view** — this is expected.  
-Rendering runs at a fixed frame rate (default 60 FPS) while real-time preview speed may vary.  
-In post-production, **adjust the playback speed** to match your song’s rhythm or desired pacing.
+#### Creative uses
+Use renders as overlays in sci-fi music videos, projection mapping, VJ sets, or motion-graphics HUD inserts.  Combine
+with AI-generated elements for even richer compositions.
 
 ---
 
-## 🧠 Creative Use
+## 🧠 Technical notes
+- Python 3.10+
+- Pygame for rendering, Pillow for image manipulation
+- Tkinter for the launcher + placeholder tools
+- All code is open-source and designed for experimentation; copy the configs into each project to craft bespoke looks.
 
-Use the generated clips as **overlays** or **backgrounds** in:
-- Sci-fi control panels and HUD screens  
-- Music video scenes  
-- VJ loops or projection mapping installations  
-
-Combine with AI-generated overlays such as the *Retro Spacecraft HUD* Sora prompt for enhanced digital depth.
-
-"
-    Black background — futuristic spacecraft HUD (heads-up display) rendered in retro digital style.
-Bright, saturated neon vector lines (cyan, amber, magenta, lime, and white) arranged in a blocky, old-computer layout. simple thick lines.
-
-text labels “NAV” and “THRUST” in a blocky mono font.
-
-Include rectangular data panels, radar grid arcs, vector crosshairs, numeric telemetry rows, rotating target markers, and ASCII-style bar graphs.
-
-Interface should look glowing and crisp, with slight CRT scanline texture.
-Layout symmetrical, but cluttered with readouts and segmented frames like a 1980s starship command terminal.
-
-No background scene — pure black canvas
-Style keywords: digital vector art, luminous edges, sci-fi instrumentation, minimal color palette, pixel precision, high contrast.
-"
-
----
-
-## 💡 Technical Notes
-
-- Written in **Python 3** using **Pygame** (display) and **Pillow** (image I/O)  
-- Linux-focused but works cross-platform with SDL2  
-- Open-source, hackable, and community-driven  
-- Developed collaboratively with **ChatGPT-5**
-
----
-
-## 📽️ Project Context
-
-**Hex Glitch** is part of the *Jumble Sale of Stimuli* open-source art series —  
-a creative experiment exploring how humans and AI can **co-create generative tools** for music, visuals, and storytelling.
-
----
-
-## 🪐 License
-
-Released under a permissive open-source license.  
-You are free to modify, remix, and use the output in your own creative projects.  
-Credit to **Jumble Sale of Stimuli** is appreciated.
-
----
-
-> 💬 *“This code isn’t about perfection — it’s about play.  
-> Every glitch, ripple, and pulse is an invitation to create.”*  
-> — *Jumble Sale of Stimuli*
-
-There will be a music video using this tool on the youtube page soon! 
+Have fun glitching!  Contributions and new tool ideas are always welcome.

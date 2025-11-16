@@ -6,6 +6,7 @@ Hex Propagation Animator — consolidated build (wash fix)
 Adds F2 help overlay, F9 mouse-target toggle, and restores Y/U color wash step.
 """
 
+import argparse
 import os
 import math
 import random
@@ -153,8 +154,16 @@ DEFAULT_CONFIG: Dict = {
 
     # Fading
     "fade_revert_rate": 0.2,
+    "words_file": "vidtext.txt",
 }
 # --------------------------------------------------------------
+
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
+DEFAULT_WORDS_FILE = "vidtext.txt"
+WORDS_FILE_PATH = os.path.join(SCRIPT_DIR, DEFAULT_WORDS_FILE)
+CONFIG: Dict = copy.deepcopy(DEFAULT_CONFIG)
 
 
 def _coerce_config_value(value, default):
@@ -198,8 +207,55 @@ def load_config(path: str) -> Dict:
     return config
 
 
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
-CONFIG: Dict = load_config(CONFIG_PATH)
+def resolve_path(path_value: Optional[str], base_dir: str) -> Optional[str]:
+    if path_value in (None, ""):
+        return path_value
+    path_str = str(path_value)
+    if os.path.isabs(path_str):
+        return path_str
+    return os.path.abspath(os.path.join(base_dir, path_str))
+
+
+def prepare_runtime_config(
+    config_path: Optional[str] = None,
+    output_root: Optional[str] = None,
+    words_file_override: Optional[str] = None,
+) -> None:
+    """Load config/paths based on CLI args or defaults."""
+
+    global CONFIG, WORDS_FILE_PATH
+
+    config_path = config_path or DEFAULT_CONFIG_PATH
+    config_dir = os.path.dirname(os.path.abspath(config_path)) if config_path else SCRIPT_DIR
+    output_dir = os.path.abspath(output_root) if output_root else config_dir
+
+    CONFIG = load_config(config_path)
+
+    image_paths = []
+    for path in get_image_list_from_config(CONFIG.get("image_path")):
+        resolved = resolve_path(path, config_dir)
+        if resolved:
+            image_paths.append(resolved)
+    CONFIG["image_path"] = image_paths
+
+    record_dir = resolve_path(CONFIG.get("record_dir", "frames_out"), output_dir)
+    save_dir = resolve_path(CONFIG.get("save_frames_dir", "frames"), output_dir)
+    CONFIG["record_dir"] = record_dir or os.path.join(output_dir, "frames_out")
+    CONFIG["save_frames_dir"] = save_dir or os.path.join(output_dir, "frames")
+
+    words_source = words_file_override or CONFIG.get("words_file") or DEFAULT_WORDS_FILE
+    WORDS_FILE_PATH = resolve_path(words_source, config_dir) or os.path.join(config_dir, DEFAULT_WORDS_FILE)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Hex Propagation Animator")
+    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to a JSON config file")
+    parser.add_argument(
+        "--output-dir",
+        help="Base directory for rendered frames/recordings (overrides record/save paths)",
+    )
+    parser.add_argument("--words-file", help="Optional override for vidtext/words file")
+    return parser.parse_args()
 
 HEX_DIRS = [(1,0),(1,-1),(0,-1),(-1,0),(-1,1),(0,1)]
 
@@ -927,9 +983,9 @@ def main():
                     if image_list: image_idx = (image_idx + 1) % len(image_list)
                 elif event.key == pygame.K_t:
                     if not text_mode:
-                        words = load_words_from_file("vidtext.txt"); word_index = 0
-                        if not words: print("[WARN] vidtext.txt not found or empty.")
-                        else: print(f"[INFO] Loaded {len(words)} words from vidtext.txt")
+                        words = load_words_from_file(WORDS_FILE_PATH); word_index = 0
+                        if not words: print(f"[WARN] Words file not found or empty: {WORDS_FILE_PATH}")
+                        else: print(f"[INFO] Loaded {len(words)} words from {WORDS_FILE_PATH}")
                         text_mode = True; next_word_at = pygame.time.get_ticks()
                     else:
                         text_mode = False
@@ -1224,5 +1280,11 @@ def main():
         except Exception: pass
     pygame.quit()
 
+
+# Load default config immediately so imported helpers can rely on CONFIG.
+prepare_runtime_config()
+
 if __name__ == "__main__":
+    args = parse_args()
+    prepare_runtime_config(args.config, args.output_dir, args.words_file)
     main()

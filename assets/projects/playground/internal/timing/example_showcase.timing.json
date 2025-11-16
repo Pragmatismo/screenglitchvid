@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "duration": 32.0,
+  "sample_rate": null,
+  "tracks": {
+    "beats_manual": {
+      "description": "Hand-tapped beats for a 120 BPM loop",
+      "events": [
+        {"time": 0.0, "label": "beat"},
+        {"time": 0.5, "label": "beat"},
+        {"time": 1.0, "label": "beat"},
+        {"time": 1.5, "label": "beat"}
+      ]
+    },
+    "fx_hits": {
+      "description": "Moments to fire large visual accents",
+      "events": [
+        {"time": 4.2, "value": 0.9, "label": "impact"},
+        {"time": 12.75, "value": 1.0, "label": "impact"},
+        {"time": 24.0, "value": 0.7, "label": "impact"}
+      ]
+    },
+    "verse_markers": {
+      "description": "Sections annotated by the user",
+      "events": [
+        {"time": 0.0, "label": "intro", "duration": 8.0},
+        {"time": 8.0, "label": "verse", "duration": 16.0},
+        {"time": 24.0, "label": "outro", "duration": 8.0}
+      ]
+    }
+  }
+}

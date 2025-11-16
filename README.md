@@ -18,7 +18,7 @@ python3 -m venv venv
 source venv/bin/activate  # Windows: venv\\Scripts\\activate
 
 # 3. Install dependencies
-pip install pygame pillow
+pip install pygame pillow numpy soundfile librosa simpleaudio
 ```
 
 ### Launch the toolbox menu
@@ -69,12 +69,37 @@ in `app_core/` (project management + future settings helpers).
 
 ## 🛠️ Available tools
 
-### Analysis — Create Basic Audio Map (placeholder)
+### Analysis — Create Basic Audio Map
 *Path:* `tools/analysis/create_basic_audio_map/tool.py`
 
-This lightweight Tkinter UI (currently a “Work in progress” window) represents the forthcoming audio-analysis pipeline
-that will ingest songs, detect BPM/downbeats, and export marker files to each project’s `internal/timing` folder.  Even in
-placeholder form it already accepts the project context passed by the main menu so it knows which workspace it will target.
+The Create Basic Audio Map tool ingests any audio file, runs a multi-track analysis pass (librosa-based beat/onset/pitch
+detectors plus high-energy windows), and then drops you into an interactive editor.  Each track is rendered on a stacked
+timeline with draggable markers, zoom controls, scrollbars with auto-pan as the playhead approaches the edge, and a detail
+grid for precise edits.  Add/remove tracks for user annotations, double-click to create new events, or rename tracks so
+other programs can reference them directly.  A Play button now streams the song (via `simpleaudio`) so you can preview
+the markers in sync while the playhead keeps itself in view, and the Analysis Settings dialog lets you tweak hop length,
+tempo tightness, RMS/pitch thresholds, and onset behaviour before re-running the detector.
+
+Timing data is stored as JSON inside each project’s `internal/timing/` folder using the following schema:
+
+```jsonc
+{
+  "version": 1,
+  "duration": 123.4,
+  "tracks": {
+    "track_name": {
+      "description": "optional",
+      "events": [
+        { "time": 0.0, "value": 1.0, "label": "beat", "duration": 0.0 }
+      ]
+    }
+  }
+}
+```
+
+Every track is functionally identical (a list of `{time, value?, label?, duration?}` events) so downstream tools can simply
+pick the track that best matches their needs, whether it originated from automatic analysis, MIDI taps, or manual notes.
+See `assets/projects/playground/internal/timing/example_showcase.timing.json` for a concrete reference file.
 
 ### Video — Hex Glitch
 *Path:* `tools/video/hex_glitch/hex_glitch.py`

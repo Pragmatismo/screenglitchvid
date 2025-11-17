@@ -15,16 +15,16 @@ from app_core.settings import load_settings
 BUTTON_IMAGE_SIZE = (220, 120)
 
 
-class HorizontalScrollFrame(ttk.Frame):
-    """Container that adds horizontal scrolling to its child frame."""
+class VerticalScrollFrame(ttk.Frame):
+    """Scrollable container that provides vertical scrolling for its child frame."""
 
-    def __init__(self, master, height: int = BUTTON_IMAGE_SIZE[1] + 140):
+    def __init__(self, master):
         super().__init__(master)
-        self.canvas = tk.Canvas(self, highlightthickness=0, height=height)
-        self.canvas.pack(side="top", fill="x", expand=True)
-        scrollbar = ttk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
-        scrollbar.pack(side="bottom", fill="x")
-        self.canvas.configure(xscrollcommand=scrollbar.set)
+        self.canvas = tk.Canvas(self, highlightthickness=0)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
         self.inner = ttk.Frame(self.canvas)
         self._window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
         self.inner.bind("<Configure>", self._update_scrollregion)
@@ -34,7 +34,7 @@ class HorizontalScrollFrame(ttk.Frame):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
     def _resize_inner(self, event) -> None:
-        self.canvas.itemconfigure(self._window, height=event.height)
+        self.canvas.itemconfigure(self._window, width=event.width)
 
 
 class ToolLauncherFrame(ttk.Frame):
@@ -215,7 +215,6 @@ class ToolboxApp(tk.Tk):
         self._blank_button_image: tk.PhotoImage | None = None
 
         style = ttk.Style(self)
-        style.configure("Heading.TLabel", font=("Segoe UI", 16, "bold"))
         style.configure("ToolTitle.TLabel", font=("Segoe UI", 12, "bold"))
 
         self._build_ui()
@@ -328,18 +327,22 @@ class ToolboxApp(tk.Tk):
         tools_frame = ttk.Frame(parent)
         tools_frame.pack(fill="both", expand=True)
 
+        scroll = VerticalScrollFrame(tools_frame)
+        scroll.pack(fill="both", expand=True)
+        scroll.inner.columnconfigure(0, weight=1)
+
         sections = [
             ("Analysis", self.analysis_tools()),
             ("Video", self.video_tools()),
         ]
-        for title, tools in sections:
-            ttk.Label(tools_frame, text=title, style="Heading.TLabel").pack(anchor="w", pady=(12, 4))
-            scroll = HorizontalScrollFrame(tools_frame)
-            scroll.pack(fill="x", expand=True, pady=(0, 8))
-            row_frame = scroll.inner
+        for idx, (title, tools) in enumerate(sections):
+            section = ttk.LabelFrame(scroll.inner, text=title, padding=(12, 8))
+            pady = (0, 0) if idx == len(sections) - 1 else (0, 12)
+            section.grid(row=idx, column=0, sticky="ew", pady=pady)
+            section.columnconfigure(0, weight=1)
             for tool_info in tools:
-                frame = ToolLauncherFrame(row_frame, self, tool_info)
-                frame.pack(side="left", padx=8, pady=4, fill="y")
+                frame = ToolLauncherFrame(section, self, tool_info)
+                frame.pack(fill="x", padx=4, pady=4)
                 self.tool_frames.append(frame)
 
     # ------------------------------------------------------------------

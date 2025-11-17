@@ -972,6 +972,9 @@ class TimedActionTool(tk.Tk):
                 codec="libx264",
                 quality=8,
                 format="FFMPEG",
+                # Avoid macro block warnings/resizing when the frame size is not a
+                # multiple of 16px (common when using extreme scale multipliers).
+                macro_block_size=1,
                 audio_path=str(plan.audio_path),
                 audio_codec="aac",
             )

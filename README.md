@@ -18,7 +18,7 @@ python3 -m venv venv
 source venv/bin/activate  # Windows: venv\\Scripts\\activate
 
 # 3. Install dependencies
-pip install pygame pillow numpy soundfile librosa simpleaudio
+pip install pygame pillow numpy soundfile librosa
 ```
 
 ### Launch the toolbox menu
@@ -76,7 +76,7 @@ The Create Basic Audio Map tool ingests any audio file, runs a multi-track analy
 detectors plus high-energy windows), and then drops you into an interactive editor.  Each track is rendered on a stacked
 timeline with draggable markers, zoom controls, scrollbars with auto-pan as the playhead approaches the edge, and a detail
 grid for precise edits.  Add/remove tracks for user annotations, double-click to create new events, or rename tracks so
-other programs can reference them directly.  A Play button now streams the song (via `simpleaudio`) so you can preview
+other programs can reference them directly.  A Play button now streams the song (via `pygame.mixer`) so you can preview
 the markers in sync while the playhead keeps itself in view, and the Analysis Settings dialog lets you tweak hop length,
 tempo tightness, RMS/pitch thresholds, and onset behaviour before re-running the detector.
 

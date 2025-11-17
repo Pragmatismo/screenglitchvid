@@ -532,8 +532,10 @@ class AudioMapTool:
         self._audio_pcm_array: Optional[Any] = None
         self._audio_samplerate = 0
         self._audio_channels = 0
-        self._play_obj: Optional[Any] = None
         self._play_buffer_bytes: Optional[bytes] = None
+        self._play_sound: Optional[Any] = None
+        self._play_channel: Optional[Any] = None
+        self._pygame: Optional[Any] = None
 
         self._build_ui()
 
@@ -804,6 +806,7 @@ class AudioMapTool:
 
     def _reset_audio_buffer(self) -> None:
         self._log("Resetting audio buffer")
+        self._stop_audio_playback()
         self._audio_pcm_array = None
         self._audio_samplerate = 0
         self._audio_channels = 0
@@ -916,17 +919,51 @@ class AudioMapTool:
         )
         return True
 
+    def _ensure_mixer(self) -> bool:
+        if not self._audio_samplerate or not self._audio_channels:
+            return False
+        try:
+            import pygame
+        except Exception:
+            self._log("pygame import failed; playback unavailable", level=logging.ERROR)
+            messagebox.showerror(
+                "Playback unavailable",
+                "Install the 'pygame' package to hear the song while previewing the timeline.",
+            )
+            return False
+        self._pygame = pygame
+        mixer = pygame.mixer
+        desired_spec = (int(self._audio_samplerate), -16, int(self._audio_channels or 1))
+        current = mixer.get_init()
+        needs_reinit = (
+            not current
+            or current[0] != desired_spec[0]
+            or current[1] != desired_spec[1]
+            or current[2] != desired_spec[2]
+        )
+        if needs_reinit:
+            try:
+                mixer.quit()
+            except Exception:
+                pass
+            try:
+                mixer.init(frequency=desired_spec[0], size=desired_spec[1], channels=desired_spec[2])
+            except Exception as exc:
+                self._log("pygame mixer init failed: %s", exc, level=logging.ERROR)
+                messagebox.showerror("Playback unavailable", f"Could not initialise audio output: {exc}")
+                return False
+            self._log(
+                "pygame mixer initialised (%d Hz, %d-bit, %d channels)",
+                desired_spec[0],
+                abs(desired_spec[1]),
+                desired_spec[2],
+            )
+        return True
+
     def _start_audio_playback(self, offset: float) -> bool:
         if self._audio_pcm_array is None or not self._audio_samplerate:
             return False
-        try:
-            import simpleaudio as sa
-        except Exception:
-            self._log("simpleaudio import failed; playback unavailable", level=logging.ERROR)
-            messagebox.showerror(
-                "Playback unavailable",
-                "Install the 'simpleaudio' package to hear the song while previewing the timeline.",
-            )
+        if not self._ensure_mixer():
             return False
         samples = len(self._audio_pcm_array)
         start_sample = min(samples, max(0, int(offset * self._audio_samplerate)))
@@ -946,36 +983,36 @@ class AudioMapTool:
             channels,
         )
         try:
-            self._play_obj = sa.play_buffer(self._play_buffer_bytes, channels, 2, self._audio_samplerate)
+            sound = self._pygame.mixer.Sound(buffer=self._play_buffer_bytes)
+            channel = sound.play()
         except Exception as exc:
+            self._log("pygame playback failed: %s", exc, level=logging.ERROR)
             messagebox.showerror("Playback failed", f"Could not start playback: {exc}")
-            self._play_obj = None
             self._play_buffer_bytes = None
             return False
+        if channel is None:
+            self._log("pygame mixer returned no channel", level=logging.ERROR)
+            messagebox.showerror("Playback failed", "No audio channels are available for playback.")
+            self._play_buffer_bytes = None
+            return False
+        self._play_sound = sound
+        self._play_channel = channel
         return True
 
     def _stop_audio_playback(self) -> None:
         self._log(
-            "Stopping audio playback (play_obj=%s, buffer=%s)",
-            bool(self._play_obj),
+            "Stopping audio playback (channel=%s, buffer=%s)",
+            bool(self._play_channel),
             bool(self._play_buffer_bytes),
         )
-        play_obj = self._play_obj
-        if play_obj is not None:
+        channel = self._play_channel
+        if channel is not None:
             try:
-                play_obj.stop()
-                # Ensure the playback thread has fully torn down before we
-                # release the PCM buffer; otherwise simpleaudio can segfault
-                # if the bytes object disappears while PortAudio still has a
-                # pointer to it.
-                try:
-                    play_obj.wait_done()
-                except Exception:
-                    # ``wait_done`` may not exist on some backends; ignore.
-                    pass
+                channel.stop()
             except Exception as exc:
-                self._log("Exception while stopping playback: %s", exc, level=logging.ERROR)
-        self._play_obj = None
+                self._log("Exception while stopping pygame channel: %s", exc, level=logging.ERROR)
+        self._play_channel = None
+        self._play_sound = None
         self._play_buffer_bytes = None
         self._log("Playback stopped and buffers cleared")
 

@@ -668,6 +668,8 @@ class TimedActionTool(tk.Tk):
         ttk.Button(action_frame, text="Render animation", command=self.render_video).pack(side="left")
         ttk.Button(action_frame, text="Play last render", command=self.play_render).pack(side="left", padx=(8, 0))
         ttk.Button(action_frame, text="Save to assets", command=self.save_render).pack(side="left", padx=(8, 0))
+        ttk.Button(action_frame, text="Load settings", command=self.load_settings).pack(side="right", padx=(0, 8))
+        ttk.Button(action_frame, text="Save settings", command=self.save_settings).pack(side="right")
 
         ttk.Label(container, textvariable=self.status_var, foreground="#4a4a4a").pack(anchor="w", pady=(12, 0))
 
@@ -701,13 +703,16 @@ class TimedActionTool(tk.Tk):
         initial_dir: Optional[Path],
         filetypes: Optional[tuple[tuple[str, str], ...]],
     ) -> None:
-        current = Path(variable.get()).expanduser()
-        if current.is_file():
+        current_value = variable.get().strip()
+        current = Path(current_value).expanduser() if current_value else None
+        if current and current.is_file():
             start_dir = current.parent
-        elif current.exists():
+        elif current and current.exists():
             start_dir = current
         elif initial_dir and initial_dir.exists():
             start_dir = initial_dir
+        elif self.assets_dir and self.assets_dir.exists():
+            start_dir = self.assets_dir
         elif self.project_root:
             start_dir = self.project_root
         else:
@@ -996,6 +1001,7 @@ class TimedActionTool(tk.Tk):
 
     # ------------------------------------------------------------------
     def play_render(self) -> None:
+        self._cleanup_playback()
         if not self.temp_render_path.exists():
             messagebox.showinfo("Playback", "Render a video first.")
             return
@@ -1006,40 +1012,49 @@ class TimedActionTool(tk.Tk):
         play_window.title("Render preview")
         label = ttk.Label(play_window)
         label.pack(fill="both", expand=True)
+        state = self._playback_state
+        state.clear()
+        state.update({"window": play_window, "timer": None})
+        play_window.protocol("WM_DELETE_WINDOW", self._cleanup_playback)
         pygame.mixer.init()
         try:
             pygame.mixer.music.load(str(self.last_plan.audio_path if self.last_plan else self.audio_path.get()))
         except Exception as exc:
-            pygame.mixer.quit()
+            self._cleanup_playback()
             messagebox.showerror("Playback", f"Unable to load audio: {exc}")
-            play_window.destroy()
             return
         pygame.mixer.music.play()
         try:
             reader = imageio.get_reader(self.temp_render_path, format="FFMPEG")
         except Exception as exc:
-            pygame.mixer.music.stop()
-            pygame.mixer.quit()
-            play_window.destroy()
+            self._cleanup_playback()
             messagebox.showerror("Playback", f"Unable to read render: {exc}")
             return
+        state["reader"] = reader
         iterator = iter(reader)
         delay_ms = int(1000 / (self.last_plan.fps if self.last_plan else DEFAULT_FPS))
 
         def show_next_frame() -> None:
+            if not state:
+                return
             try:
                 frame = next(iterator)
             except StopIteration:
-                reader.close()
-                pygame.mixer.music.stop()
-                pygame.mixer.quit()
-                play_window.destroy()
+                self._cleanup_playback()
+                return
+            except Exception as exc:  # pragma: no cover - runtime safeguard
+                self._cleanup_playback()
+                messagebox.showerror("Playback", f"Error during preview: {exc}")
                 return
             image = Image.fromarray(frame)
             photo = ImageTk.PhotoImage(image)
             label.configure(image=photo)
             label.image = photo
-            play_window.after(delay_ms, show_next_frame)
+            if not play_window.winfo_exists():
+                self._cleanup_playback()
+                return
+            timer_id = play_window.after(delay_ms, show_next_frame)
+            state["timer"] = timer_id
 
         show_next_frame()
 
@@ -1059,6 +1074,110 @@ class TimedActionTool(tk.Tk):
             messagebox.showerror("Save", f"Unable to copy render: {exc}")
             return
         self.status_var.set(f"Saved render to {target}")
+
+    # ------------------------------------------------------------------
+    def save_settings(self) -> None:
+        file_path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Save mixer settings",
+            defaultextension=".json",
+            initialdir=str(self.output_dir),
+            filetypes=(("JSON", "*.json"), ("All files", "*.*")),
+        )
+        if not file_path:
+            return
+        payload = self._serialize_settings()
+        try:
+            Path(file_path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as exc:
+            messagebox.showerror("Save settings", f"Unable to save settings:\n{exc}")
+            return
+        self.status_var.set(f"Settings saved to {Path(file_path).name}.")
+
+    # ------------------------------------------------------------------
+    def load_settings(self) -> None:
+        file_path = filedialog.askopenfilename(
+            parent=self,
+            title="Load mixer settings",
+            initialdir=str(self.output_dir),
+            filetypes=(("JSON", "*.json"), ("All files", "*.*")),
+        )
+        if not file_path:
+            return
+        try:
+            payload = json.loads(Path(file_path).read_text(encoding="utf-8"))
+        except Exception as exc:
+            messagebox.showerror("Load settings", f"Unable to read settings:\n{exc}")
+            return
+        self._apply_settings(payload)
+        self.status_var.set(f"Settings loaded from {Path(file_path).name}.")
+
+    # ------------------------------------------------------------------
+    def _serialize_settings(self) -> Dict[str, Any]:
+        return {
+            "audio_path": self.audio_path.get(),
+            "timing_path": self.timing_path.get(),
+            "associations": [
+                {
+                    "track_name": assoc.track_name,
+                    "mode": assoc.mode,
+                    "options": dict(assoc.options),
+                }
+                for assoc in self.associations
+            ],
+        }
+
+    # ------------------------------------------------------------------
+    def _apply_settings(self, payload: Dict[str, Any]) -> None:
+        audio_path = str(payload.get("audio_path", ""))
+        timing_path = str(payload.get("timing_path", ""))
+        self.audio_path.set(audio_path)
+        self.timing_path.set(timing_path)
+        self.associations = []
+        assoc_payloads = payload.get("associations", [])
+        if isinstance(assoc_payloads, list):
+            for entry in assoc_payloads:
+                if not isinstance(entry, dict):
+                    continue
+                track_name = entry.get("track_name")
+                mode = entry.get("mode")
+                options = entry.get("options", {})
+                if not track_name or not mode or not isinstance(options, dict):
+                    continue
+                self.associations.append(
+                    AssociationConfig(track_name=str(track_name), mode=str(mode), options=dict(options))
+                )
+        self._refresh_assoc_tree()
+        if timing_path:
+            self._load_timing()
+
+    # ------------------------------------------------------------------
+    def _cleanup_playback(self) -> None:
+        state = self._playback_state
+        if not state:
+            return
+        window = state.get("window")
+        timer = state.get("timer")
+        reader = state.get("reader")
+        if timer and window and window.winfo_exists():
+            try:
+                window.after_cancel(timer)
+            except Exception:
+                pass
+        if reader:
+            try:
+                reader.close()
+            except Exception:
+                pass
+        if pygame and pygame.mixer.get_init():
+            try:
+                pygame.mixer.music.stop()
+            except Exception:
+                pass
+            pygame.mixer.quit()
+        if window and window.winfo_exists():
+            window.destroy()
+        state.clear()
 
 
 # ---------------------------------------------------------------------------

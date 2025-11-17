@@ -136,6 +136,9 @@ class FireworkEffect(VisualEffect):
         self.target_x = rng.uniform(width * 0.1, width * 0.9)
         self.target_y = rng.uniform(height * 0.2, height * 0.8)
         self.intensity = max(0.2, intensity)
+        self.scale = max(0.1, float(options.get("scale", 1.0)))
+        self.variance = max(0.0, min(1.0, float(options.get("variance", 0.2))))
+        self.scale_variation = 1.0 + rng.uniform(-self.variance, self.variance)
         palette = [
             (255, 214, 0),
             (255, 126, 0),
@@ -143,9 +146,42 @@ class FireworkEffect(VisualEffect):
             (166, 73, 255),
             (83, 224, 255),
         ]
-        self.colour = random.choice(palette)
+        colour_choice = str(options.get("color", "random")).lower()
+        colour_lookup = {
+            "white": (255, 255, 255),
+            "red": (255, 80, 80),
+            "green": (120, 255, 120),
+            "blue": (120, 180, 255),
+        }
+        if colour_choice == "random":
+            self.colour = rng.choice(palette)
+        else:
+            self.colour = colour_lookup.get(colour_choice, palette[0])
         self.height = height
         self.width = width
+        firework_type = str(options.get("firework_type", "random")).lower()
+        self.available_types = ["ring", "star", "burst", "spray"]
+        if firework_type not in self.available_types and firework_type != "random":
+            firework_type = "random"
+        if firework_type == "random":
+            firework_type = rng.choice(self.available_types)
+        self.firework_type = firework_type
+        self.rays: list[tuple[float, float, float]] = []
+        if self.firework_type in {"star", "burst"}:
+            ray_count = rng.randint(8, 16)
+            for _ in range(ray_count):
+                angle = rng.uniform(0, math.tau)
+                length = rng.uniform(0.6, 1.2)
+                width_scale = rng.uniform(1.5, 3.5)
+                self.rays.append((angle, length, width_scale))
+        self.spray_particles: list[tuple[float, float, float]] = []
+        if self.firework_type == "spray":
+            particle_count = rng.randint(30, 45)
+            for _ in range(particle_count):
+                angle = rng.uniform(-math.pi / 2, math.pi / 2)
+                distance = rng.uniform(0.4, 1.1)
+                size = rng.uniform(2, 4)
+                self.spray_particles.append((angle, distance, size))
 
     def draw(self, image: Image.Image, time_s: float) -> None:  # pragma: no cover - requires human inspection
         draw = ImageDraw.Draw(image, "RGBA")
@@ -161,7 +197,29 @@ class FireworkEffect(VisualEffect):
         decay = 1.0
         if self.end_time > self.event_time:
             decay = max(0.0, 1.0 - (time_s - self.event_time) / (self.end_time - self.event_time))
-        base_radius = 40 * self.intensity
+        base_radius = 40 * self.intensity * self.scale * self.scale_variation
+        if self.firework_type == "ring":
+            self._draw_ring(draw, base_radius, decay)
+        elif self.firework_type == "star":
+            self._draw_star(draw, base_radius, decay)
+        elif self.firework_type == "burst":
+            self._draw_burst(draw, base_radius, decay)
+        elif self.firework_type == "spray":
+            self._draw_spray(draw, base_radius, decay)
+        else:
+            self._draw_ring(draw, base_radius, decay)
+        spark_radius = (6 + 8 * self.intensity * decay) * self.scale * 0.8
+        draw.ellipse(
+            (
+                self.target_x - spark_radius,
+                self.target_y - spark_radius,
+                self.target_x + spark_radius,
+                self.target_y + spark_radius,
+            ),
+            fill=self.colour + (int(150 * decay),),
+        )
+
+    def _draw_ring(self, draw: ImageDraw.ImageDraw, base_radius: float, decay: float) -> None:
         for layer in range(3):
             ratio = (layer + 1) / 3
             radius = base_radius * ratio * (0.6 + 0.4 * math.sin(min(1.0, decay) * math.pi))
@@ -174,16 +232,61 @@ class FireworkEffect(VisualEffect):
                 self.target_y + radius,
             )
             draw.ellipse(bbox, outline=colour, width=3)
-        spark_radius = 6 + 8 * self.intensity * decay
-        draw.ellipse(
-            (
-                self.target_x - spark_radius,
-                self.target_y - spark_radius,
-                self.target_x + spark_radius,
-                self.target_y + spark_radius,
-            ),
-            fill=self.colour + (int(150 * decay),),
-        )
+
+    def _draw_star(self, draw: ImageDraw.ImageDraw, base_radius: float, decay: float) -> None:
+        alpha = int(210 * decay)
+        colour = self.colour + (alpha,)
+        for angle, length, width_scale in self.rays:
+            radius = base_radius * length
+            end_x = self.target_x + radius * math.cos(angle)
+            end_y = self.target_y + radius * math.sin(angle)
+            draw.line(
+                [(self.target_x, self.target_y), (end_x, end_y)],
+                fill=colour,
+                width=max(1, int(2 * width_scale)),
+            )
+
+    def _draw_burst(self, draw: ImageDraw.ImageDraw, base_radius: float, decay: float) -> None:
+        for angle, length, width_scale in self.rays:
+            radius = base_radius * (length + 0.2)
+            start_x = self.target_x + base_radius * 0.2 * math.cos(angle)
+            start_y = self.target_y + base_radius * 0.2 * math.sin(angle)
+            end_x = self.target_x + radius * math.cos(angle)
+            end_y = self.target_y + radius * math.sin(angle)
+            alpha = int(200 * decay)
+            colour = self.colour + (alpha,)
+            draw.line(
+                [(start_x, start_y), (end_x, end_y)],
+                fill=colour,
+                width=max(1, int(3 * width_scale)),
+            )
+            spark_alpha = int(180 * decay)
+            spark_radius = max(1.5, 3.5 * (1.0 - decay))
+            draw.ellipse(
+                (
+                    end_x - spark_radius,
+                    end_y - spark_radius,
+                    end_x + spark_radius,
+                    end_y + spark_radius,
+                ),
+                fill=self.colour + (spark_alpha,),
+            )
+
+    def _draw_spray(self, draw: ImageDraw.ImageDraw, base_radius: float, decay: float) -> None:
+        for angle, distance, size in self.spray_particles:
+            radius = base_radius * distance
+            end_x = self.target_x + radius * math.cos(angle)
+            end_y = self.target_y - radius * math.sin(angle)
+            alpha = int(200 * decay)
+            draw.ellipse(
+                (
+                    end_x - size,
+                    end_y - size,
+                    end_x + size,
+                    end_y + size,
+                ),
+                fill=self.colour + (alpha,),
+            )
 
 
 class SpritePopEffect(VisualEffect):
@@ -300,15 +403,29 @@ class RenderPlan:
 
 
 class AssociationDialog(simpledialog.Dialog):
-    def __init__(self, parent, tracks: Iterable[str], config: Optional[AssociationConfig] = None):
+    def __init__(
+        self,
+        parent,
+        tracks: Iterable[str],
+        config: Optional[AssociationConfig] = None,
+        selected_track: Optional[str] = None,
+    ):
         self.track_names = list(tracks)
         self.config = config
+        self.selected_track = selected_track
         self.result_config: Optional[AssociationConfig] = None
         super().__init__(parent, title="Configure timed action")
 
     def body(self, master):
         ttk.Label(master, text="Timing track:").grid(row=0, column=0, sticky="w")
-        self.track_var = tk.StringVar(value=(self.config.track_name if self.config else (self.track_names[0] if self.track_names else "")))
+        default_track = ""
+        if self.config:
+            default_track = self.config.track_name
+        elif self.selected_track and self.selected_track in self.track_names:
+            default_track = self.selected_track
+        elif self.track_names:
+            default_track = self.track_names[0]
+        self.track_var = tk.StringVar(value=default_track)
         self.track_combo = ttk.Combobox(master, values=self.track_names, textvariable=self.track_var, state="readonly")
         self.track_combo.grid(row=0, column=1, sticky="ew")
         master.columnconfigure(1, weight=1)
@@ -326,10 +443,20 @@ class AssociationDialog(simpledialog.Dialog):
         return self.track_combo
 
     def _build_option_inputs(self) -> None:
-        self.firework_vars = {
-            "pre_launch_frames": tk.StringVar(value=str(self.config.options.get("pre_launch_frames", 12) if self.config and self.config.mode == "fireworks" else 12)),
-            "fade": tk.StringVar(value=str(self.config.options.get("fade", 0.6) if self.config and self.config.mode == "fireworks" else 0.6)),
+        firework_defaults = {
+            "pre_launch_frames": 12,
+            "fade": 0.6,
+            "scale": 1.0,
+            "variance": 0.2,
+            "color": "random",
+            "firework_type": "random",
         }
+        self.firework_vars: dict[str, tk.StringVar] = {}
+        for key, default in firework_defaults.items():
+            value = default
+            if self.config and self.config.mode == "fireworks":
+                value = self.config.options.get(key, default)
+            self.firework_vars[key] = tk.StringVar(value=str(value))
         sprite_defaults = {
             "sprite_path": "",
             "scale": 1.0,
@@ -353,6 +480,26 @@ class AssociationDialog(simpledialog.Dialog):
             ttk.Entry(self.options_frame, textvariable=self.firework_vars["pre_launch_frames"], width=8).grid(row=1, column=1, sticky="w")
             ttk.Label(self.options_frame, text="Fade seconds (fallback when timing has no duration):").grid(row=2, column=0, sticky="w")
             ttk.Entry(self.options_frame, textvariable=self.firework_vars["fade"], width=8).grid(row=2, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Scale factor:").grid(row=3, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.firework_vars["scale"], width=8).grid(row=3, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Size variance (0-1):").grid(row=4, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.firework_vars["variance"], width=8).grid(row=4, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Color:").grid(row=5, column=0, sticky="w")
+            ttk.Combobox(
+                self.options_frame,
+                values=["random", "white", "red", "green", "blue"],
+                textvariable=self.firework_vars["color"],
+                state="readonly",
+                width=10,
+            ).grid(row=5, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Firework type:").grid(row=6, column=0, sticky="w")
+            ttk.Combobox(
+                self.options_frame,
+                values=["random", "ring", "star", "burst", "spray"],
+                textvariable=self.firework_vars["firework_type"],
+                state="readonly",
+                width=10,
+            ).grid(row=6, column=1, sticky="w")
         else:
             ttk.Label(self.options_frame, text="Sprite pop options:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", columnspan=3)
             ttk.Label(self.options_frame, text="Sprite image:").grid(row=1, column=0, sticky="w")
@@ -388,6 +535,10 @@ class AssociationDialog(simpledialog.Dialog):
             options = {
                 "pre_launch_frames": int(self.firework_vars["pre_launch_frames"].get() or 12),
                 "fade": float(self.firework_vars["fade"].get() or 0.6),
+                "scale": float(self.firework_vars["scale"].get() or 1.0),
+                "variance": float(self.firework_vars["variance"].get() or 0.2),
+                "color": self.firework_vars["color"].get() or "random",
+                "firework_type": self.firework_vars["firework_type"].get() or "random",
             }
         else:
             options = {
@@ -478,12 +629,20 @@ class TimedActionTool(tk.Tk):
         )
 
         ttk.Label(container, text="Timing tracks", style="Heading.TLabel").pack(anchor="w")
-        self.tracks_tree = ttk.Treeview(container, columns=("events", "description"), show="headings", height=5)
+        self.tracks_tree = ttk.Treeview(
+            container,
+            columns=("name", "events", "description"),
+            show="headings",
+            height=5,
+        )
+        self.tracks_tree.heading("name", text="Track")
         self.tracks_tree.heading("events", text="Events")
         self.tracks_tree.heading("description", text="Description")
+        self.tracks_tree.column("name", width=180)
         self.tracks_tree.column("events", width=80, anchor="center")
-        self.tracks_tree.column("description", width=520)
+        self.tracks_tree.column("description", width=420)
         self.tracks_tree.pack(fill="x", pady=(4, 12))
+        self.tracks_tree.bind("<Double-1>", self._on_track_double_click)
 
         assoc_frame = ttk.LabelFrame(container, text="Track associations")
         assoc_frame.pack(fill="both", expand=True)
@@ -500,7 +659,9 @@ class TimedActionTool(tk.Tk):
         buttons.pack(fill="x")
         ttk.Button(buttons, text="Add", command=self.add_association).pack(side="left")
         ttk.Button(buttons, text="Edit", command=self.edit_association).pack(side="left", padx=(6, 0))
+        ttk.Button(buttons, text="Duplicate", command=self.duplicate_association).pack(side="left", padx=(6, 0))
         ttk.Button(buttons, text="Remove", command=self.remove_association).pack(side="left", padx=(6, 0))
+        self.assoc_tree.bind("<Double-1>", lambda _evt: self.edit_association())
 
         action_frame = ttk.Frame(container)
         action_frame.pack(fill="x", pady=(12, 0))
@@ -605,15 +766,32 @@ class TimedActionTool(tk.Tk):
             self.tracks_tree.delete(item)
         for track in self.timing_doc.tracks.values():
             desc = track.description or "-"
-            self.tracks_tree.insert("", "end", iid=track.name, values=(len(track.events), desc))
+            self.tracks_tree.insert(
+                "",
+                "end",
+                iid=track.name,
+                values=(track.name, len(track.events), desc),
+            )
         self.status_var.set(f"Loaded {len(self.timing_doc.tracks)} tracks from timing file.")
 
     # ------------------------------------------------------------------
-    def add_association(self) -> None:
+    def _on_track_double_click(self, event) -> None:
+        track_id = self.tracks_tree.identify_row(event.y)
+        if not track_id:
+            return
+        self.tracks_tree.selection_set(track_id)
+        self.add_association(track_name=track_id)
+
+    # ------------------------------------------------------------------
+    def add_association(self, track_name: Optional[str] = None) -> None:
         if not self.timing_doc or not self.timing_doc.tracks:
             messagebox.showwarning("Timing tracks", "Load a timing file before adding associations.")
             return
-        dialog = AssociationDialog(self, self.timing_doc.tracks.keys())
+        dialog = AssociationDialog(
+            self,
+            self.timing_doc.tracks.keys(),
+            selected_track=track_name,
+        )
         if dialog.result_config:
             self.associations.append(dialog.result_config)
             self._refresh_assoc_tree()
@@ -624,7 +802,14 @@ class TimedActionTool(tk.Tk):
             self.assoc_tree.delete(item)
         for idx, assoc in enumerate(self.associations):
             if assoc.mode == "fireworks":
-                summary = f"Lead {assoc.options.get('pre_launch_frames', 12)}f, fade {assoc.options.get('fade', 0.6)}s"
+                summary = (
+                    f"Lead {assoc.options.get('pre_launch_frames', 12)}f, "
+                    f"fade {assoc.options.get('fade', 0.6)}s, "
+                    f"scale {assoc.options.get('scale', 1.0)}, "
+                    f"variance {assoc.options.get('variance', 0.2)}, "
+                    f"color {assoc.options.get('color', 'random')}, "
+                    f"type {assoc.options.get('firework_type', 'random')}"
+                )
             else:
                 summary = (
                     f"Sprite {Path(assoc.options.get('sprite_path', '')).name or 'generated'}, "
@@ -640,10 +825,30 @@ class TimedActionTool(tk.Tk):
             return
         idx = int(selection[0])
         assoc = self.associations[idx]
-        dialog = AssociationDialog(self, self.timing_doc.tracks.keys() if self.timing_doc else [], assoc)
+        dialog = AssociationDialog(
+            self,
+            self.timing_doc.tracks.keys() if self.timing_doc else [],
+            assoc,
+        )
         if dialog.result_config:
             self.associations[idx] = dialog.result_config
             self._refresh_assoc_tree()
+
+    # ------------------------------------------------------------------
+    def duplicate_association(self) -> None:
+        selection = self.assoc_tree.selection()
+        if not selection:
+            return
+        idx = int(selection[0])
+        assoc = self.associations[idx]
+        duplicate = AssociationConfig(
+            track_name=assoc.track_name,
+            mode=assoc.mode,
+            options=dict(assoc.options),
+        )
+        self.associations.insert(idx + 1, duplicate)
+        self._refresh_assoc_tree()
+        self.assoc_tree.selection_set(str(idx + 1))
 
     # ------------------------------------------------------------------
     def remove_association(self) -> None:

@@ -925,12 +925,22 @@ class AudioMapTool:
         return True
 
     def _stop_audio_playback(self) -> None:
-        if self._play_obj is not None:
+        play_obj = self._play_obj
+        if play_obj is not None:
             try:
-                self._play_obj.stop()
+                play_obj.stop()
+                # Ensure the playback thread has fully torn down before we
+                # release the PCM buffer; otherwise simpleaudio can segfault
+                # if the bytes object disappears while PortAudio still has a
+                # pointer to it.
+                try:
+                    play_obj.wait_done()
+                except Exception:
+                    # ``wait_done`` may not exist on some backends; ignore.
+                    pass
             except Exception:
                 pass
-            self._play_obj = None
+        self._play_obj = None
         self._play_buffer_bytes = None
 
     def _refresh_track_list(self) -> None:

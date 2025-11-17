@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import threading
 import time
@@ -14,6 +15,9 @@ from typing import Any, Callable, Dict, Iterable, List, MutableMapping, Optional
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
+
+
+LOG = logging.getLogger("audio_map_tool")
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +537,9 @@ class AudioMapTool:
 
         self._build_ui()
 
+    def _log(self, message: str, *args: object, level: int = logging.INFO) -> None:
+        LOG.log(level, message, *args)
+
     # UI construction ------------------------------------------------------
     def _build_ui(self) -> None:
         title = "Create Basic Audio Map"
@@ -654,6 +661,7 @@ class AudioMapTool:
             return
         self._stop_playback()
         self.audio_path = Path(path)
+        self._log("Audio chosen: %s", self.audio_path)
         self.audio_var.set(str(self.audio_path))
         self.analyse_btn.config(state="normal")
         self._reset_audio_buffer()
@@ -668,6 +676,7 @@ class AudioMapTool:
 
     def _toggle_playback(self) -> None:
         if self._is_playing:
+            self._log("Play button pressed while playing; stopping playback")
             self._stop_playback()
             return
         if not self.doc:
@@ -680,6 +689,7 @@ class AudioMapTool:
             self.timeline.focus_playhead(0.0)
         if not self._start_audio_playback(start_time):
             return
+        self._log("Playback started from %.3fs", start_time)
         self._is_playing = True
         self._play_offset = start_time
         self._play_start_time = time.perf_counter()
@@ -687,6 +697,7 @@ class AudioMapTool:
         self._schedule_playhead()
 
     def _stop_playback(self) -> None:
+        self._log("Stopping timeline playback (playhead at %.3fs)", self.timeline.current_playhead_time)
         self._is_playing = False
         self._stop_audio_playback()
         if self._playback_job:
@@ -697,6 +708,7 @@ class AudioMapTool:
             self._playback_job = None
         self._play_offset = self.timeline.current_playhead_time
         self.status_var.set("Playback stopped.")
+        self._log("Playback stopped; next start offset %.3fs", self._play_offset)
 
     def _schedule_playhead(self) -> None:
         if not self._is_playing or not self.doc:
@@ -704,6 +716,7 @@ class AudioMapTool:
         elapsed = time.perf_counter() - self._play_start_time + self._play_offset
         if elapsed >= self.doc.duration:
             self.timeline.focus_playhead(self.doc.duration)
+            self._log("Playback reached end of doc (%.3fs)", self.doc.duration)
             self._stop_playback()
             return
         self.timeline.focus_playhead(elapsed)
@@ -790,6 +803,7 @@ class AudioMapTool:
         self.status_var.set(f"Saved timing to {relative_path}.")
 
     def _reset_audio_buffer(self) -> None:
+        self._log("Resetting audio buffer")
         self._audio_pcm_array = None
         self._audio_samplerate = 0
         self._audio_channels = 0
@@ -880,6 +894,7 @@ class AudioMapTool:
             )
             return False
         try:
+            self._log("Loading audio buffer from %s", self.audio_path)
             data, sr = sf.read(str(self.audio_path), dtype="float32", always_2d=True)
         except Exception as exc:
             messagebox.showerror("Audio load failed", f"Could not read audio: {exc}")
@@ -893,6 +908,12 @@ class AudioMapTool:
         self._audio_pcm_array = pcm
         self._audio_samplerate = int(sr)
         self._audio_channels = pcm.shape[1] if pcm.ndim > 1 else 1
+        self._log(
+            "Audio buffer ready (%d samples, %d channels, %d Hz)",
+            len(pcm),
+            self._audio_channels,
+            self._audio_samplerate,
+        )
         return True
 
     def _start_audio_playback(self, offset: float) -> bool:
@@ -901,6 +922,7 @@ class AudioMapTool:
         try:
             import simpleaudio as sa
         except Exception:
+            self._log("simpleaudio import failed; playback unavailable", level=logging.ERROR)
             messagebox.showerror(
                 "Playback unavailable",
                 "Install the 'simpleaudio' package to hear the song while previewing the timeline.",
@@ -910,11 +932,19 @@ class AudioMapTool:
         start_sample = min(samples, max(0, int(offset * self._audio_samplerate)))
         subset = self._audio_pcm_array[start_sample:]
         if subset.size == 0:
+            self._log("Playback start subset empty at %.3fs", offset, level=logging.WARNING)
             return False
         audio_bytes = subset.tobytes()
         self._stop_audio_playback()
         self._play_buffer_bytes = audio_bytes
         channels = self._audio_channels or 1
+        self._log(
+            "Starting playback at %.3fs (sample %d / %d, %d channels)",
+            offset,
+            start_sample,
+            samples,
+            channels,
+        )
         try:
             self._play_obj = sa.play_buffer(self._play_buffer_bytes, channels, 2, self._audio_samplerate)
         except Exception as exc:
@@ -925,6 +955,11 @@ class AudioMapTool:
         return True
 
     def _stop_audio_playback(self) -> None:
+        self._log(
+            "Stopping audio playback (play_obj=%s, buffer=%s)",
+            bool(self._play_obj),
+            bool(self._play_buffer_bytes),
+        )
         play_obj = self._play_obj
         if play_obj is not None:
             try:
@@ -938,10 +973,11 @@ class AudioMapTool:
                 except Exception:
                     # ``wait_done`` may not exist on some backends; ignore.
                     pass
-            except Exception:
-                pass
+            except Exception as exc:
+                self._log("Exception while stopping playback: %s", exc, level=logging.ERROR)
         self._play_obj = None
         self._play_buffer_bytes = None
+        self._log("Playback stopped and buffers cleared")
 
     def _refresh_track_list(self) -> None:
         self.track_list.delete(0, tk.END)
@@ -1187,12 +1223,24 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Audio analysis + timing editor")
     parser.add_argument("--project", help="Active project directory", default=None)
     parser.add_argument("--project-name", help="Active project name", default=None)
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        help="Logging verbosity (e.g. DEBUG, INFO, WARNING)",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    log_level_name = str(args.log_level).upper()
+    log_level = getattr(logging, log_level_name, logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
     project = Path(args.project).resolve() if args.project else None
+    LOG.info("Launching AudioMapTool (project=%s, project_name=%s)", project, args.project_name)
     root = tk.Tk()
     tool = AudioMapTool(root=root, project=project, project_name=args.project_name)
     if project and not project.exists():

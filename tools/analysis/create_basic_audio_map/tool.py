@@ -312,6 +312,7 @@ class TimelineCanvas(tk.Canvas):
         on_add_marker: Callable[[str, float], None],
         on_delete_marker: Callable[[str, int], None],
         on_seek: Callable[[float], None],
+        edit_mode_provider: Optional[Callable[[], bool]] = None,
         *args,
         **kwargs,
     ) -> None:
@@ -324,6 +325,7 @@ class TimelineCanvas(tk.Canvas):
         self._on_add_marker = on_add_marker
         self._on_delete_marker = on_delete_marker
         self._on_seek = on_seek
+        self._edit_mode_provider = edit_mode_provider
         self._playhead_item: Optional[int] = None
         self._playhead_time = 0.0
         self._drag_item: Optional[int] = None
@@ -432,7 +434,7 @@ class TimelineCanvas(tk.Canvas):
 
     # event handling -------------------------------------------------------
     def _handle_click(self, event: tk.Event) -> None:  # type: ignore[override]
-        shift_down = bool(getattr(event, "state", 0) & 0x0001)
+        shift_down = self._is_edit_mode_active(event)
         x = self.canvasx(event.x)
         y = self.canvasy(event.y)
         timestamp = max(0.0, min(self._duration, self._x_to_time(x)))
@@ -472,7 +474,7 @@ class TimelineCanvas(tk.Canvas):
         self._drag_index = None
 
     def _handle_double_click(self, event: tk.Event) -> None:  # type: ignore[override]
-        shift_down = bool(getattr(event, "state", 0) & 0x0001)
+        shift_down = self._is_edit_mode_active(event)
         x = self.canvasx(event.x)
         y = self.canvasy(event.y)
         timestamp = max(0.0, min(self._duration, self._x_to_time(x)))
@@ -486,7 +488,7 @@ class TimelineCanvas(tk.Canvas):
             self._on_add_marker(track_name, timestamp)
 
     def _handle_right_click(self, event: tk.Event) -> None:  # type: ignore[override]
-        shift_down = bool(getattr(event, "state", 0) & 0x0001)
+        shift_down = self._is_edit_mode_active(event)
         x = self.canvasx(event.x)
         y = self.canvasy(event.y)
         timestamp = max(0.0, min(self._duration, self._x_to_time(x)))
@@ -553,6 +555,16 @@ class TimelineCanvas(tk.Canvas):
         minutes = seconds // 60
         secs = seconds % 60
         return f"{minutes}:{secs:02d}"
+
+    def _is_edit_mode_active(self, event: Optional[tk.Event]) -> bool:
+        shift_down = bool(getattr(event, "state", 0) & 0x0001) if event else False
+        if self._edit_mode_provider:
+            try:
+                if self._edit_mode_provider():
+                    return True
+            except Exception:
+                pass
+        return shift_down
 
     # scroll helpers --------------------------------------------------------
     def _on_mousewheel(self, event: tk.Event) -> str:
@@ -640,6 +652,8 @@ class AudioMapTool:
         self.status_var = tk.StringVar(value="Select an audio file to begin.")
         ttk.Label(toolbar, textvariable=self.status_var).grid(row=1, column=0, columnspan=7, sticky="w", pady=(6, 0))
 
+        self.edit_mode_var = tk.BooleanVar(value=False)
+
         main = ttk.Frame(self.root)
         main.grid(row=1, column=0, sticky="nsew")
         main.columnconfigure(2, weight=1)
@@ -679,6 +693,7 @@ class AudioMapTool:
             on_add_marker=self._add_event_at_time,
             on_delete_marker=self._delete_event_from_timeline,
             on_seek=self._seek_from_timeline,
+            edit_mode_provider=self._is_edit_mode,
         )
         self.timeline.grid(row=0, column=0, sticky="nsew")
         self.timeline.configure(xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
@@ -691,6 +706,12 @@ class AudioMapTool:
         self.zoom_var = tk.DoubleVar(value=80.0)
         zoom_slider = ttk.Scale(zoom_frame, from_=20, to=400, orient="horizontal", variable=self.zoom_var, command=self._on_zoom)
         zoom_slider.pack(fill="x", expand=True, padx=(6, 6))
+
+        ttk.Checkbutton(
+            zoom_frame,
+            text="Edit mode (Shift)",
+            variable=self.edit_mode_var,
+        ).pack(side=tk.LEFT, padx=(6, 0))
 
         play_frame = ttk.Frame(zoom_frame)
         play_frame.pack(side=tk.RIGHT)
@@ -718,7 +739,38 @@ class AudioMapTool:
         ttk.Button(btn_frame, text="Edit event", command=self._edit_event_dialog).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(btn_frame, text="Delete event", command=self._delete_event).pack(side=tk.LEFT, padx=(6, 0))
 
+        detail_frame = ttk.Labelframe(editor, text="Selected event")
+        detail_frame.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        detail_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(detail_frame, text="Time (s)").grid(row=0, column=0, sticky="w")
+        self.event_time_var = tk.StringVar(value="")
+        ttk.Entry(detail_frame, textvariable=self.event_time_var).grid(row=0, column=1, sticky="ew", padx=6, pady=2)
+
+        ttk.Label(detail_frame, text="Value").grid(row=1, column=0, sticky="w")
+        self.event_value_var = tk.StringVar(value="")
+        ttk.Entry(detail_frame, textvariable=self.event_value_var).grid(row=1, column=1, sticky="ew", padx=6, pady=2)
+
+        ttk.Label(detail_frame, text="Label").grid(row=2, column=0, sticky="w")
+        self.event_label_var = tk.StringVar(value="")
+        ttk.Entry(detail_frame, textvariable=self.event_label_var).grid(row=2, column=1, sticky="ew", padx=6, pady=2)
+
+        ttk.Label(detail_frame, text="Duration (s)").grid(row=3, column=0, sticky="w")
+        self.event_duration_var = tk.StringVar(value="")
+        ttk.Entry(detail_frame, textvariable=self.event_duration_var).grid(row=3, column=1, sticky="ew", padx=6, pady=2)
+
+        self.apply_event_btn = ttk.Button(
+            detail_frame,
+            text="Apply changes",
+            command=self._apply_event_field_changes,
+            state="disabled",
+        )
+        self.apply_event_btn.grid(row=4, column=0, columnspan=2, pady=(8, 4))
+
     # UI callbacks --------------------------------------------------------
+    def _is_edit_mode(self) -> bool:
+        return bool(self.edit_mode_var.get())
+
     def _choose_audio(self) -> None:
         initialdir = self.assets_dir if self.assets_dir.exists() else Path.cwd()
         path = filedialog.askopenfilename(
@@ -1123,6 +1175,7 @@ class AudioMapTool:
     def _refresh_event_tree(self) -> None:
         for row in self.event_tree.get_children():
             self.event_tree.delete(row)
+        self._update_event_form(None)
         if not self.doc:
             return
         track_name = self._selected_track_name
@@ -1260,6 +1313,69 @@ class AudioMapTool:
             self._refresh_event_tree()
             self.timeline.redraw()
 
+    def _update_event_form(self, event: Optional[TimingEvent]) -> None:
+        if not hasattr(self, "event_time_var"):
+            return
+        if event:
+            self.event_time_var.set(f"{event.time:.3f}")
+            self.event_value_var.set("" if event.value is None else str(event.value))
+            self.event_label_var.set(event.label or "")
+            self.event_duration_var.set("" if event.duration is None else str(event.duration))
+            self.apply_event_btn.config(state="normal")
+        else:
+            self.event_time_var.set("")
+            self.event_value_var.set("")
+            self.event_label_var.set("")
+            self.event_duration_var.set("")
+            self.apply_event_btn.config(state="disabled")
+
+    def _apply_event_field_changes(self) -> None:
+        track_name = self._selected_track_name
+        idx = self._selected_event_index
+        if not self.doc or not track_name or idx is None:
+            return
+        track = self.doc.tracks[track_name]
+        if not (0 <= idx < len(track.events)):
+            return
+        event = track.events[idx]
+        try:
+            time_value = float(self.event_time_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid time", "Time must be numeric.")
+            return
+        value_field: Optional[float]
+        value_raw = self.event_value_var.get().strip()
+        if value_raw:
+            try:
+                value_field = float(value_raw)
+            except ValueError:
+                messagebox.showerror("Invalid value", "Value must be numeric if provided.")
+                return
+        else:
+            value_field = None
+        duration_field: Optional[float]
+        duration_raw = self.event_duration_var.get().strip()
+        if duration_raw:
+            try:
+                duration_field = float(duration_raw)
+            except ValueError:
+                messagebox.showerror("Invalid duration", "Duration must be numeric if provided.")
+                return
+        else:
+            duration_field = None
+        event.time = max(0.0, time_value)
+        event.value = value_field
+        event.label = self.event_label_var.get().strip() or None
+        event.duration = duration_field
+        track.sort_events()
+        new_index = track.events.index(event)
+        self._refresh_event_tree()
+        self.event_tree.selection_set(str(new_index))
+        self.event_tree.focus(str(new_index))
+        self.timeline.redraw()
+        self._update_event_form(event)
+        self.status_var.set("Updated event details.")
+
     @property
     def _selected_event_index(self) -> Optional[int]:
         selection = self.event_tree.selection()
@@ -1351,8 +1467,10 @@ class AudioMapTool:
         track = self.doc.tracks[track_name]
         if idx >= len(track.events):
             return
-        timestamp = track.events[idx].time
+        event = track.events[idx]
+        timestamp = event.time
         self.timeline.focus_playhead(timestamp)
+        self._update_event_form(event)
 
 
 # ---------------------------------------------------------------------------

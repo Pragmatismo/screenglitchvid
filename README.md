@@ -75,14 +75,19 @@ in `app_core/` (project management + future settings helpers).
 The Create Basic Audio Map tool ingests any audio file, runs a multi-track analysis pass (librosa-based beat/onset/pitch
 detectors plus high-energy windows), and then drops you into an interactive editor.  Each track is rendered on a stacked
 timeline with zoom controls, scrollbars with auto-pan as the playhead approaches the edge, one-second/ten-second tick
-marks, and a detail grid for precise edits.  Click anywhere (without modifiers) to move the playhead instantly; hold
-**Shift** to enter edit mode where Shift+drag repositions markers, Shift+double-click adds events, and Shift+right-click
-removes the clicked marker.  Duration events are drawn as full-width rectangles spanning their entire time range so you
-can see overlaps at a glance.  A Play button streams the song (via `pygame.mixer`) so you can preview the markers in sync
-while the playhead keeps itself in view, and the Analysis Settings dialog lets you tweak hop length, tempo tightness,
-RMS/pitch thresholds, and onset behaviour before re-running the detector.
+marks, and a detail grid for precise edits.  Click anywhere (without modifiers) to move the playhead instantly.  Hold
+**Shift** or enable the **Edit mode** toggle to manipulate markers: drag them along the timeline, Shift+double-click to
+add events, and Shift+right-click to remove the clicked marker.  Duration events are drawn as full-width rectangles
+spanning their entire time range so you can see overlaps at a glance.  A Play button streams the song (via
+`pygame.mixer`) so you can preview the markers in sync while the playhead keeps itself in view, and the Analysis Settings
+dialog lets you tweak hop length, tempo tightness, RMS/pitch thresholds, and onset behaviour before re-running the
+detector.  Selecting a marker also exposes inline fields for editing its time/value/duration without leaving the event
+list.
 
-Timing data is stored as JSON inside each project’s `internal/timing/` folder using the following schema:
+Timing data is stored as JSON inside each project’s `internal/timing/` folder.  Every timing file is a single document
+that can bundle any number of interchangeable tracks—automatic analysis passes, MIDI taps, manual annotations, or other
+sources.  Each track is simply a list of timestamped events so downstream tools can select whichever track they require
+without worrying about its origin.  The on-disk structure is intentionally small and friendly to other tools:
 
 ```jsonc
 {
@@ -99,9 +104,22 @@ Timing data is stored as JSON inside each project’s `internal/timing/` folder 
 }
 ```
 
-Every track is functionally identical (a list of `{time, value?, label?, duration?}` events) so downstream tools can simply
-pick the track that best matches their needs, whether it originated from automatic analysis, MIDI taps, or manual notes.
-See `assets/projects/playground/internal/timing/example_showcase.timing.json` for a concrete reference file.
+**Key integration notes**
+
+- `time` and `duration` are always expressed in seconds relative to the audio’s start.  Tools that operate in beats can
+  convert using their own BPM maps while keeping the same timestamps for cross-sync.
+- `value` is optional and can represent any scalar (intensity, confidence, velocity…).  Consumers that do not care about
+  it can simply ignore the field.
+- `label` is a free-form string that callers can use for grouping (e.g., `impact`, `verse`, `drop`).
+- `data` can hold additional per-event metadata (IDs, colour hints, etc.) without changing the schema.  Unknown keys
+  should be preserved if a tool rewrites the file so collaborative workflows remain intact.
+
+Because every track is represented with the exact same schema, you can mix and match sources freely: copy MIDI-derived
+beats into the same file as an automatically-detected onset track, add a “pyro_cues” list recorded live, or maintain
+multiple variations for experimentation.  Downstream programs only need to prompt the user for a timing file, enumerate
+`tracks`, and read the `events` list for the chosen entry.  See
+`assets/projects/playground/internal/timing/example_showcase.timing.json` for a concrete reference file that demonstrates
+beats, one-shot FX triggers, and long-form section markers side by side.
 
 ### Video — Hex Glitch
 *Path:* `tools/video/hex_glitch/hex_glitch.py`

@@ -1471,13 +1471,23 @@ class AudioMapTool:
         if not freq_doc or not freq_doc.bin_count:
             self.freq_status_var.set("Frequency data not loaded.")
             return
-        for idx, (start, end) in enumerate(freq_doc.bin_edges):
+        for idx, _edges in enumerate(freq_doc.bin_edges):
             bar_frame = ttk.Frame(self.freq_bar_container)
-            bar_frame.pack(side=tk.LEFT, padx=2)
-            bar = ttk.Progressbar(bar_frame, orient="vertical", length=80, mode="determinate", maximum=100)
+            bar_frame.pack(side=tk.LEFT, padx=1)
+            bar = ttk.Progressbar(
+                bar_frame,
+                orient="vertical",
+                length=160,
+                mode="determinate",
+                maximum=100,
+            )
             bar.pack(fill="y")
-            label_text = f"Bin {idx + 1}\n{int(start)}-{int(end)} Hz"
-            ttk.Label(bar_frame, text=label_text, font=("Segoe UI", 7), justify="center").pack(pady=(2, 0))
+            ttk.Label(
+                bar_frame,
+                text=str(idx + 1),
+                font=("Segoe UI", 7),
+                justify="center",
+            ).pack(pady=(2, 0))
             self.freq_bar_widgets.append(bar)
         self.freq_status_var.set(
             f"{freq_doc.bin_count} bins • {freq_doc.capture_rate:.1f} samples/s"

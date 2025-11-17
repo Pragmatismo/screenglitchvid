@@ -18,7 +18,7 @@ python3 -m venv venv
 source venv/bin/activate  # Windows: venv\\Scripts\\activate
 
 # 3. Install dependencies
-pip install pygame pillow numpy soundfile librosa
+pip install pygame pillow numpy soundfile librosa imageio imageio-ffmpeg
 ```
 
 ### Launch the toolbox menu
@@ -166,6 +166,22 @@ You can still run it directly for experiments by choosing a config and optional 
 #### Creative uses
 Use renders as overlays in sci-fi music videos, projection mapping, VJ sets, or motion-graphics HUD inserts.  Combine
 with AI-generated elements for even richer compositions.
+
+### Video — Timed Action Mixer
+*Path:* `tools/video/timed_action_mixer/timed_action_mixer.py`
+
+Timed Action Mixer ties together the timing documents produced by the analysis tools with lightweight animation modes.
+Pick an audio file, load a timing JSON, then associate any track with one of the currently-supported modes:
+
+- **Fireworks** — launches a rocket a few frames ahead of the event so it reaches the beat in sync, then explodes into
+  fading rings.  When the timing marker contains `value` or `duration`, the effect automatically reuses them for
+  intensity and fade time respectively.
+- **Sprite pop** — lets you pick an image plus scale/zoom/hold settings.  Sprites pop into existence slightly before
+  the event, hover for the configured hang time, then tumble down the screen under gravity.
+
+You can add multiple associations (even reusing the same track in different modes), control their order, and render a
+full video with audio via `imageio`/FFmpeg.  The tool keeps a temporary MP4 for quick previews (Play button) and
+includes a Save workflow that copies the clip into the active project’s `assets/` folder.
 
 ---
 

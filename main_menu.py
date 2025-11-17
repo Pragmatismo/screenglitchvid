@@ -341,6 +341,18 @@ class ToolboxApp(tk.Tk):
                 "project_internal_path": ("video", "hex_glitch"),
                 "project_config_name": "config.json",
                 "uses_output_dir": True,
+            },
+            {
+                "key": "timed_action_mixer",
+                "name": "Timed Action Mixer",
+                "button_label": "Launch timed action mixer",
+                "description": "Associate timing tracks with fireworks + sprite pop overlays and render video clips.",
+                "script": self.repo_root / "tools/video/timed_action_mixer/timed_action_mixer.py",
+                "supports_project_settings": True,
+                "requires_config": False,
+                "project_internal_path": ("video", "timed_action_mixer"),
+                "uses_output_dir": True,
+                "passes_project": True,
             }
         ]
 

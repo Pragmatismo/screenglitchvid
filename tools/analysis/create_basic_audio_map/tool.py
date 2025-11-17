@@ -310,6 +310,8 @@ class TimelineCanvas(tk.Canvas):
         master: tk.Widget,
         on_select: Callable[[str, int], None],
         on_add_marker: Callable[[str, float], None],
+        on_delete_marker: Callable[[str, int], None],
+        on_seek: Callable[[float], None],
         *args,
         **kwargs,
     ) -> None:
@@ -320,6 +322,8 @@ class TimelineCanvas(tk.Canvas):
         self._order: List[str] = []
         self._on_select = on_select
         self._on_add_marker = on_add_marker
+        self._on_delete_marker = on_delete_marker
+        self._on_seek = on_seek
         self._playhead_item: Optional[int] = None
         self._playhead_time = 0.0
         self._drag_item: Optional[int] = None
@@ -332,6 +336,7 @@ class TimelineCanvas(tk.Canvas):
         self._scroll_width = 0.0
         self._scroll_height = 0.0
         self.bind("<Button-1>", self._handle_click)
+        self.bind("<Button-3>", self._handle_right_click)
         self.bind("<B1-Motion>", self._handle_drag)
         self.bind("<ButtonRelease-1>", self._handle_release)
         self.bind("<Double-Button-1>", self._handle_double_click)
@@ -380,6 +385,8 @@ class TimelineCanvas(tk.Canvas):
         self._scroll_width = width
         self._scroll_height = total_height
 
+        self._draw_time_guides(total_height)
+
         for idx, track_name in enumerate(self._order):
             y = idx * self._row_height + self._row_height / 2 + 20
             self.create_text(10, y, text=track_name, anchor="w", fill="#f0f0f0")
@@ -393,11 +400,14 @@ class TimelineCanvas(tk.Canvas):
                 color = "#4dd0e1" if event.label != "pitch_change" else "#b388ff"
                 if event.duration and event.duration > 0:
                     width_px = event.duration * self._pixels_per_second
+                    half_height = max(8, self._row_height / 2 - 6)
+                    top = y - half_height
+                    bottom = y + half_height
                     rect = self.create_rectangle(
                         x,
-                        y - 8,
+                        top,
                         x + width_px,
-                        y + 8,
+                        bottom,
                         fill="#2e7d32",
                         outline="",
                         stipple="gray25",
@@ -422,7 +432,15 @@ class TimelineCanvas(tk.Canvas):
 
     # event handling -------------------------------------------------------
     def _handle_click(self, event: tk.Event) -> None:  # type: ignore[override]
-        item = self.find_closest(event.x, event.y)
+        shift_down = bool(getattr(event, "state", 0) & 0x0001)
+        x = self.canvasx(event.x)
+        y = self.canvasy(event.y)
+        timestamp = max(0.0, min(self._duration, self._x_to_time(x)))
+        if not shift_down:
+            self.focus_playhead(timestamp)
+            self._on_seek(timestamp)
+            return
+        item = self.find_closest(x, y)
         if not item:
             return
         tags = self.gettags(item)
@@ -431,13 +449,14 @@ class TimelineCanvas(tk.Canvas):
             if track_info:
                 self._drag_item = item[0]
                 self._drag_track, self._drag_index = track_info
-                self._mouse_start_time = self._x_to_time(event.x)
+                self._mouse_start_time = timestamp
                 self._on_select(self._drag_track, self._drag_index)
 
     def _handle_drag(self, event: tk.Event) -> None:  # type: ignore[override]
         if self._drag_item is None or self._drag_track is None or self._drag_index is None:
             return
-        new_time = self._x_to_time(event.x)
+        x = self.canvasx(event.x)
+        new_time = self._x_to_time(x)
         new_time = max(0.0, min(self._duration, new_time))
         track = self._tracks[self._drag_track]
         event_obj = track.events[self._drag_index]
@@ -453,12 +472,37 @@ class TimelineCanvas(tk.Canvas):
         self._drag_index = None
 
     def _handle_double_click(self, event: tk.Event) -> None:  # type: ignore[override]
-        track_idx = int((event.y - 20) // self._row_height)
+        shift_down = bool(getattr(event, "state", 0) & 0x0001)
+        x = self.canvasx(event.x)
+        y = self.canvasy(event.y)
+        timestamp = max(0.0, min(self._duration, self._x_to_time(x)))
+        if not shift_down:
+            self.focus_playhead(timestamp)
+            self._on_seek(timestamp)
+            return
+        track_idx = int((y - 20) // self._row_height)
         if 0 <= track_idx < len(self._order):
             track_name = self._order[track_idx]
-            timestamp = self._x_to_time(event.x)
-            timestamp = max(0.0, min(self._duration, timestamp))
             self._on_add_marker(track_name, timestamp)
+
+    def _handle_right_click(self, event: tk.Event) -> None:  # type: ignore[override]
+        shift_down = bool(getattr(event, "state", 0) & 0x0001)
+        x = self.canvasx(event.x)
+        y = self.canvasy(event.y)
+        timestamp = max(0.0, min(self._duration, self._x_to_time(x)))
+        if not shift_down:
+            self.focus_playhead(timestamp)
+            self._on_seek(timestamp)
+            return
+        item = self.find_closest(x, y)
+        if not item:
+            return
+        tags = self.gettags(item)
+        if "marker" not in tags:
+            return
+        track_info = self._item_to_event.get(item[0])
+        if track_info:
+            self._on_delete_marker(*track_info)
 
     def _time_to_x(self, timestamp: float) -> float:
         return self._left_margin + timestamp * self._pixels_per_second
@@ -485,6 +529,30 @@ class TimelineCanvas(tk.Canvas):
         elif x < view_start + margin:
             new_start = max(0.0, x - margin)
             self.xview_moveto(new_start / total_width)
+
+    def _draw_time_guides(self, total_height: float) -> None:
+        if self._duration <= 0:
+            return
+        seconds = int(math.ceil(self._duration))
+        for second in range(seconds + 1):
+            x = self._time_to_x(float(second))
+            if second % 10 == 0:
+                line_height = total_height
+                color = "#2f2f2f"
+                width = 2
+            else:
+                line_height = total_height
+                color = "#1f1f1f"
+                width = 1
+            self.create_line(x, 10, x, line_height, fill=color, width=width)
+            if second % 30 == 0:
+                label = self._format_time_label(second)
+                self.create_text(x + 4, 10, text=label, anchor="nw", fill="#b0b0b0", font=("Segoe UI", 8))
+
+    def _format_time_label(self, seconds: int) -> str:
+        minutes = seconds // 60
+        secs = seconds % 60
+        return f"{minutes}:{secs:02d}"
 
     # scroll helpers --------------------------------------------------------
     def _on_mousewheel(self, event: tk.Event) -> str:
@@ -609,6 +677,8 @@ class AudioMapTool:
             canvas_container,
             on_select=self._select_event_from_timeline,
             on_add_marker=self._add_event_at_time,
+            on_delete_marker=self._delete_event_from_timeline,
+            on_seek=self._seek_from_timeline,
         )
         self.timeline.grid(row=0, column=0, sticky="nsew")
         self.timeline.configure(xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
@@ -675,6 +745,27 @@ class AudioMapTool:
 
     def _on_zoom(self, _value: str) -> None:
         self.timeline.set_zoom(self.zoom_var.get())
+
+    def _seek_from_timeline(self, timestamp: float) -> None:
+        if not self.doc:
+            return
+        timestamp = max(0.0, min(self.doc.duration, timestamp))
+        was_playing = self._is_playing
+        if was_playing:
+            self._stop_playback()
+        self.timeline.focus_playhead(timestamp)
+        self._play_offset = timestamp
+        if was_playing:
+            if not self._ensure_audio_buffer():
+                return
+            if not self._start_audio_playback(timestamp):
+                return
+            self._is_playing = True
+            self._play_start_time = time.perf_counter()
+            self.status_var.set("Playing timeline + audio.")
+            self._schedule_playhead()
+        else:
+            self.status_var.set(f"Playhead moved to {timestamp:.2f}s")
 
     def _toggle_playback(self) -> None:
         if self._is_playing:
@@ -1127,6 +1218,17 @@ class AudioMapTool:
         self.doc.tracks[track_name].events.append(event)
         self.doc.tracks[track_name].sort_events()
         self._refresh_event_tree()
+        self.timeline.redraw()
+
+    def _delete_event_from_timeline(self, track_name: str, index: int) -> None:
+        if not self.doc:
+            return
+        track = self.doc.tracks.get(track_name)
+        if not track or not (0 <= index < len(track.events)):
+            return
+        track.events.pop(index)
+        self._refresh_event_tree()
+        self.timeline.redraw()
 
     def _edit_event_dialog(self) -> None:
         track_name = self._selected_track_name
@@ -1143,6 +1245,7 @@ class AudioMapTool:
         track.events[event_idx] = updated
         track.sort_events()
         self._refresh_event_tree()
+        self.timeline.redraw()
 
     def _delete_event(self) -> None:
         track_name = self._selected_track_name
@@ -1155,6 +1258,7 @@ class AudioMapTool:
             track = self.doc.tracks[track_name]
             track.events.pop(idx)
             self._refresh_event_tree()
+            self.timeline.redraw()
 
     @property
     def _selected_event_index(self) -> Optional[int]:

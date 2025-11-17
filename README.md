@@ -74,11 +74,13 @@ in `app_core/` (project management + future settings helpers).
 
 The Create Basic Audio Map tool ingests any audio file, runs a multi-track analysis pass (librosa-based beat/onset/pitch
 detectors plus high-energy windows), and then drops you into an interactive editor.  Each track is rendered on a stacked
-timeline with draggable markers, zoom controls, scrollbars with auto-pan as the playhead approaches the edge, and a detail
-grid for precise edits.  Add/remove tracks for user annotations, double-click to create new events, or rename tracks so
-other programs can reference them directly.  A Play button now streams the song (via `pygame.mixer`) so you can preview
-the markers in sync while the playhead keeps itself in view, and the Analysis Settings dialog lets you tweak hop length,
-tempo tightness, RMS/pitch thresholds, and onset behaviour before re-running the detector.
+timeline with zoom controls, scrollbars with auto-pan as the playhead approaches the edge, one-second/ten-second tick
+marks, and a detail grid for precise edits.  Click anywhere (without modifiers) to move the playhead instantly; hold
+**Shift** to enter edit mode where Shift+drag repositions markers, Shift+double-click adds events, and Shift+right-click
+removes the clicked marker.  Duration events are drawn as full-width rectangles spanning their entire time range so you
+can see overlaps at a glance.  A Play button streams the song (via `pygame.mixer`) so you can preview the markers in sync
+while the playhead keeps itself in view, and the Analysis Settings dialog lets you tweak hop length, tempo tightness,
+RMS/pitch thresholds, and onset behaviour before re-running the detector.
 
 Timing data is stored as JSON inside each project’s `internal/timing/` folder using the following schema:
 

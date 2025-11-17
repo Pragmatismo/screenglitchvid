@@ -416,6 +416,11 @@ class TimedActionTool(tk.Tk):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.assets_dir = (self.project_root / "assets") if self.project_root else (self.repo_root / "assets")
         self.assets_dir.mkdir(parents=True, exist_ok=True)
+        if self.project_root:
+            self.timing_dir = self.project_root / "internal" / "timing"
+        else:
+            self.timing_dir = self.repo_root / "assets" / "timing"
+        self.timing_dir.mkdir(parents=True, exist_ok=True)
         self.temp_render_path = self.output_dir / "timed_action_preview.mp4"
 
         self.audio_path = tk.StringVar()
@@ -445,8 +450,32 @@ class TimedActionTool(tk.Tk):
 
         file_frame = ttk.LabelFrame(container, text="Source files")
         file_frame.pack(fill="x", padx=(0, 4), pady=(0, 10))
-        self._build_file_selector(file_frame, "Audio file:", self.audio_path, row=0, callback=self._guess_audio)
-        self._build_file_selector(file_frame, "Timing file:", self.timing_path, row=1, callback=self._load_timing)
+        audio_types = (
+            ("Audio", "*.wav *.mp3 *.flac *.ogg *.m4a"),
+            ("All files", "*.*"),
+        )
+        timing_types = (
+            ("Timing JSON", "*.json"),
+            ("All files", "*.*"),
+        )
+        self._build_file_selector(
+            file_frame,
+            "Audio file:",
+            self.audio_path,
+            row=0,
+            callback=self._guess_audio,
+            initial_dir=self.assets_dir,
+            filetypes=audio_types,
+        )
+        self._build_file_selector(
+            file_frame,
+            "Timing file:",
+            self.timing_path,
+            row=1,
+            callback=self._load_timing,
+            initial_dir=self.timing_dir,
+            filetypes=timing_types,
+        )
 
         ttk.Label(container, text="Timing tracks", style="Heading.TLabel").pack(anchor="w")
         self.tracks_tree = ttk.Treeview(container, columns=("events", "description"), show="headings", height=5)
@@ -489,23 +518,45 @@ class TimedActionTool(tk.Tk):
         variable: tk.StringVar,
         row: int,
         callback,
+        initial_dir: Optional[Path] = None,
+        filetypes: Optional[tuple[tuple[str, str], ...]] = None,
     ) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(4, 6), pady=4)
         entry = ttk.Entry(parent, textvariable=variable, width=60)
         entry.grid(row=row, column=1, sticky="ew", pady=4)
         parent.columnconfigure(1, weight=1)
-        btn = ttk.Button(parent, text="Browse", command=lambda: self._browse_file(variable, callback))
+        btn = ttk.Button(
+            parent,
+            text="Browse",
+            command=lambda: self._browse_file(variable, callback, initial_dir, filetypes),
+        )
         btn.grid(row=row, column=2, sticky="e", padx=(6, 4))
 
     # ------------------------------------------------------------------
-    def _browse_file(self, variable: tk.StringVar, callback) -> None:
-        initial = Path(variable.get()).expanduser()
-        if not initial.exists():
-            if self.project_root:
-                initial = self.project_root
-            else:
-                initial = self.repo_root
-        file_path = filedialog.askopenfilename(initialdir=str(initial), title="Select file")
+    def _browse_file(
+        self,
+        variable: tk.StringVar,
+        callback,
+        initial_dir: Optional[Path],
+        filetypes: Optional[tuple[tuple[str, str], ...]],
+    ) -> None:
+        current = Path(variable.get()).expanduser()
+        if current.is_file():
+            start_dir = current.parent
+        elif current.exists():
+            start_dir = current
+        elif initial_dir and initial_dir.exists():
+            start_dir = initial_dir
+        elif self.project_root:
+            start_dir = self.project_root
+        else:
+            start_dir = self.repo_root
+        open_filetypes = filetypes or (("All files", "*.*"),)
+        file_path = filedialog.askopenfilename(
+            initialdir=str(start_dir),
+            title="Select file",
+            filetypes=open_filetypes,
+        )
         if file_path:
             variable.set(file_path)
             if callback:
@@ -516,6 +567,28 @@ class TimedActionTool(tk.Tk):
         path = Path(self.audio_path.get()).expanduser()
         if path.exists():
             self.status_var.set(f"Audio track selected: {path.name}")
+            timing = self._find_matching_timing(path)
+            if timing:
+                self.timing_path.set(str(timing))
+                self._load_timing()
+
+    # ------------------------------------------------------------------
+    def _find_matching_timing(self, audio_path: Path) -> Optional[Path]:
+        stem = audio_path.stem
+        candidates = [
+            f"{stem}.timing.json",
+            f"{stem}_timing.json",
+            f"{stem}.json",
+        ]
+        search_dirs = [audio_path.parent, self.timing_dir, self.assets_dir]
+        for directory in search_dirs:
+            if not directory:
+                continue
+            for candidate in candidates:
+                possible = directory / candidate
+                if possible.exists():
+                    return possible
+        return None
 
     # ------------------------------------------------------------------
     def _load_timing(self) -> None:

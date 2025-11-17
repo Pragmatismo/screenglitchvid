@@ -529,6 +529,7 @@ class AudioMapTool:
         self._audio_samplerate = 0
         self._audio_channels = 0
         self._play_obj: Optional[Any] = None
+        self._play_buffer_bytes: Optional[bytes] = None
 
         self._build_ui()
 
@@ -792,6 +793,7 @@ class AudioMapTool:
         self._audio_pcm_array = None
         self._audio_samplerate = 0
         self._audio_channels = 0
+        self._play_buffer_bytes = None
 
     def _edit_analysis_settings(self) -> None:
         dialog = tk.Toplevel(self.root)
@@ -911,12 +913,14 @@ class AudioMapTool:
             return False
         audio_bytes = subset.tobytes()
         self._stop_audio_playback()
+        self._play_buffer_bytes = audio_bytes
         channels = self._audio_channels or 1
         try:
-            self._play_obj = sa.play_buffer(audio_bytes, channels, 2, self._audio_samplerate)
+            self._play_obj = sa.play_buffer(self._play_buffer_bytes, channels, 2, self._audio_samplerate)
         except Exception as exc:
             messagebox.showerror("Playback failed", f"Could not start playback: {exc}")
             self._play_obj = None
+            self._play_buffer_bytes = None
             return False
         return True
 
@@ -927,6 +931,7 @@ class AudioMapTool:
             except Exception:
                 pass
             self._play_obj = None
+        self._play_buffer_bytes = None
 
     def _refresh_track_list(self) -> None:
         self.track_list.delete(0, tk.END)

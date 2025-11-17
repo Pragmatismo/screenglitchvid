@@ -128,15 +128,7 @@ class ProjectManager:
     # ------------------------------------------------------------------
     def summarize_project(self, project: ProjectInfo) -> Dict[str, str]:
         assets_count = sum(1 for _ in project.assets_dir.glob("**/*") if _.is_file())
-        timing_dir = project.internal_dir / "timing"
-        timing_files = list(timing_dir.glob("*.json"))
-        timing_summary = "Timing file available" if timing_files else "No timing file yet"
-        return {
-            "assets": f"{assets_count} asset file(s)",
-            "assets_path": str(project.assets_dir),
-            "internal_path": str(project.internal_dir),
-            "timing": timing_summary,
-        }
+        return {"assets": f"{assets_count} asset file(s)"}
 
     def project_exists(self, slug: str) -> bool:
         return any(entry["slug"] == slug for entry in self._meta["projects"])

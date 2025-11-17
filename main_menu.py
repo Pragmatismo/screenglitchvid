@@ -6,10 +6,35 @@ import subprocess
 import sys
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from app_core.projects import ProjectManager
 from app_core.settings import load_settings
+
+
+BUTTON_IMAGE_SIZE = (220, 120)
+
+
+class VerticalScrollFrame(ttk.Frame):
+    """Scrollable container that provides vertical scrolling for its child frame."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.canvas = tk.Canvas(self, highlightthickness=0)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.inner = ttk.Frame(self.canvas)
+        self._window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", self._update_scrollregion)
+        self.canvas.bind("<Configure>", self._resize_inner)
+
+    def _update_scrollregion(self, _event=None) -> None:
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _resize_inner(self, event) -> None:
+        self.canvas.itemconfigure(self._window, width=event.width)
 
 
 class ToolLauncherFrame(ttk.Frame):
@@ -29,8 +54,16 @@ class ToolLauncherFrame(ttk.Frame):
     def _build(self) -> None:
         self.columnconfigure(1, weight=1)
         button_label = self.tool_info.get("button_label", f"Launch {self.tool_info['name']}")
-        self.launch_btn = ttk.Button(self, text=button_label, command=self.launch_tool)
-        self.launch_btn.grid(row=0, column=0, rowspan=3, padx=(0, 12), sticky="ns")
+        self.button_image = self.app.get_tool_button_image(self.tool_info)
+        self.launch_btn = ttk.Button(
+            self,
+            text=button_label,
+            image=self.button_image,
+            compound="center",
+            command=self.launch_tool,
+            width=0,
+        )
+        self.launch_btn.grid(row=0, column=0, rowspan=6, padx=(0, 12), sticky="n")
 
         info = ttk.Frame(self)
         info.grid(row=0, column=1, sticky="nsew")
@@ -178,9 +211,10 @@ class ToolboxApp(tk.Tk):
         self.project_manager = ProjectManager(self.repo_root, self.settings)
         self.current_project = self.project_manager.get_last_selected_project()
         self.tool_frames: list[ToolLauncherFrame] = []
+        self.button_image_cache: dict[str, tk.PhotoImage] = {}
+        self._blank_button_image: tk.PhotoImage | None = None
 
         style = ttk.Style(self)
-        style.configure("Heading.TLabel", font=("Segoe UI", 16, "bold"))
         style.configure("ToolTitle.TLabel", font=("Segoe UI", 12, "bold"))
 
         self._build_ui()
@@ -266,14 +300,9 @@ class ToolboxApp(tk.Tk):
 
     # ------------------------------------------------------------------
     def _build_summary(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="Project details")
+        frame = ttk.LabelFrame(parent, text="")
         frame.pack(fill="x")
-        labels = [
-            ("assets", "Assets"),
-            ("assets_path", "Assets folder"),
-            ("internal_path", "Internal data"),
-            ("timing", "Timing file"),
-        ]
+        labels = [("assets", "Assets")]
         self.summary_vars: dict[str, tk.StringVar] = {}
         for row, (key, title) in enumerate(labels):
             ttk.Label(frame, text=f"{title}:").grid(row=row, column=0, sticky="w", padx=(6, 6), pady=2)
@@ -298,17 +327,22 @@ class ToolboxApp(tk.Tk):
         tools_frame = ttk.Frame(parent)
         tools_frame.pack(fill="both", expand=True)
 
+        scroll = VerticalScrollFrame(tools_frame)
+        scroll.pack(fill="both", expand=True)
+        scroll.inner.columnconfigure(0, weight=1)
+
         sections = [
             ("Analysis", self.analysis_tools()),
             ("Video", self.video_tools()),
         ]
-        for title, tools in sections:
-            ttk.Label(tools_frame, text=title, style="Heading.TLabel").pack(anchor="w", pady=(12, 4))
-            section_frame = ttk.Frame(tools_frame)
-            section_frame.pack(fill="x", expand=True)
+        for idx, (title, tools) in enumerate(sections):
+            section = ttk.LabelFrame(scroll.inner, text=title, padding=(12, 8))
+            pady = (0, 0) if idx == len(sections) - 1 else (0, 12)
+            section.grid(row=idx, column=0, sticky="ew", pady=pady)
+            section.columnconfigure(0, weight=1)
             for tool_info in tools:
-                frame = ToolLauncherFrame(section_frame, self, tool_info)
-                frame.pack(fill="x", pady=4)
+                frame = ToolLauncherFrame(section, self, tool_info)
+                frame.pack(fill="x", padx=4, pady=4)
                 self.tool_frames.append(frame)
 
     # ------------------------------------------------------------------
@@ -320,6 +354,7 @@ class ToolboxApp(tk.Tk):
                 "button_label": "Launch audio map tool",
                 "description": "Load a song and build tempo/timing markers (placeholder UI).",
                 "script": self.repo_root / "tools/analysis/create_basic_audio_map/tool.py",
+                "button_image": self.repo_root / "assets/ui/button_images/audio_map.png",
                 "supports_project_settings": True,
                 "requires_config": False,
                 "passes_project": True,
@@ -335,16 +370,69 @@ class ToolboxApp(tk.Tk):
                 "button_label": "Launch Hex Glitch",
                 "description": "Realtime hex-grid glitch animator with capture + overlays.",
                 "script": self.repo_root / "tools/video/hex_glitch/hex_glitch.py",
+                "button_image": self.repo_root / "assets/ui/button_images/hex_glitch.png",
                 "supports_project_settings": True,
                 "requires_config": True,
                 "default_config": self.repo_root / "tools/video/hex_glitch/config.json",
                 "project_internal_path": ("video", "hex_glitch"),
                 "project_config_name": "config.json",
                 "uses_output_dir": True,
+            },
+            {
+                "key": "timed_action_mixer",
+                "name": "Timed Action Mixer",
+                "button_label": "Launch timed action mixer",
+                "description": "Associate timing tracks with fireworks + sprite pop overlays and render video clips.",
+                "script": self.repo_root / "tools/video/timed_action_mixer/timed_action_mixer.py",
+                "button_image": self.repo_root / "assets/ui/button_images/timed_action_mixer.png",
+                "supports_project_settings": True,
+                "requires_config": False,
+                "project_internal_path": ("video", "timed_action_mixer"),
+                "uses_output_dir": True,
+                "passes_project": True,
             }
         ]
 
     # ------------------------------------------------------------------
+    def get_tool_button_image(self, tool_info: dict) -> tk.PhotoImage:
+        key = tool_info["key"]
+        if key in self.button_image_cache:
+            return self.button_image_cache[key]
+
+        path = Path(tool_info.get("button_image", ""))
+        photo: tk.PhotoImage
+        if path.exists():
+            try:
+                photo = tk.PhotoImage(file=str(path))
+            except tk.TclError:
+                photo = self._get_blank_button_image()
+        else:
+            default_path = self.repo_root / "assets/ui/button_images/default.png"
+            if default_path.exists():
+                try:
+                    photo = tk.PhotoImage(file=str(default_path))
+                except tk.TclError:
+                    photo = self._get_blank_button_image()
+            else:
+                photo = self._get_blank_button_image()
+
+        self.button_image_cache[key] = photo
+        return photo
+
+    def _get_blank_button_image(self) -> tk.PhotoImage:
+        if self._blank_button_image is not None:
+            return self._blank_button_image
+        width, height = BUTTON_IMAGE_SIZE
+        img = tk.PhotoImage(width=width, height=height)
+        bg_color = "#1f1f1f"
+        border_color = "#3a3a3a"
+        img.put(bg_color, to=(0, 0, width, height))
+        img.put(border_color, to=(0, 0, width, 1))
+        img.put(border_color, to=(0, height - 1, width, height))
+        img.put(border_color, to=(0, 0, 1, height))
+        img.put(border_color, to=(width - 1, 0, width, height))
+        self._blank_button_image = img
+        return img
     def run(self) -> None:
         self.mainloop()
 

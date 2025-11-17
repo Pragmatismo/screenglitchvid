@@ -8,6 +8,7 @@ import logging
 import math
 import threading
 import time
+from bisect import bisect_right
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -126,6 +127,83 @@ class TimingDocument:
 
 
 @dataclass
+class FrequencyFrame:
+    """Single snapshot of per-bin frequency levels."""
+
+    time: float
+    levels: List[float]
+
+    def to_dict(self) -> Dict[str, object]:
+        return {"time": float(self.time), "levels": list(self.levels)}
+
+    @classmethod
+    def from_dict(cls, payload: MutableMapping[str, object]) -> "FrequencyFrame":
+        time = float(payload.get("time", 0.0))
+        levels = [float(value) for value in payload.get("levels", [])]
+        return cls(time=time, levels=levels)
+
+
+@dataclass
+class FrequencyDocument:
+    """Dense frequency bin data stored separately from sparse timing tracks."""
+
+    duration: float
+    sample_rate: Optional[int]
+    bin_edges: List[Tuple[float, float]]
+    capture_rate: float
+    frames: List[FrequencyFrame]
+    version: int = 1
+
+    @property
+    def bin_count(self) -> int:
+        return len(self.bin_edges)
+
+    def levels_at(self, timestamp: float) -> List[float]:
+        if not self.frames:
+            return [0.0 for _ in range(self.bin_count)]
+        times = [frame.time for frame in self.frames]
+        idx = bisect_right(times, timestamp) - 1
+        if idx < 0:
+            idx = 0
+        idx = min(idx, len(self.frames) - 1)
+        frame = self.frames[idx]
+        # Pad if frames don't have expected length
+        if len(frame.levels) < self.bin_count:
+            padded = list(frame.levels) + [0.0] * (self.bin_count - len(frame.levels))
+            return padded
+        return frame.levels[: self.bin_count]
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "version": self.version,
+            "duration": self.duration,
+            "sample_rate": self.sample_rate,
+            "bin_edges": [[float(start), float(end)] for start, end in self.bin_edges],
+            "capture_rate": self.capture_rate,
+            "frames": [frame.to_dict() for frame in self.frames],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: MutableMapping[str, object]) -> "FrequencyDocument":
+        duration = float(payload.get("duration", 0.0))
+        sample_rate = payload.get("sample_rate")
+        bin_edges_payload = payload.get("bin_edges", [])
+        bin_edges: List[Tuple[float, float]] = [
+            (float(item[0]), float(item[1])) for item in bin_edges_payload if isinstance(item, (list, tuple)) and len(item) >= 2
+        ]
+        capture_rate = float(payload.get("capture_rate", 0.0))
+        frames_payload = payload.get("frames", [])
+        frames = [FrequencyFrame.from_dict(item) for item in frames_payload]
+        return cls(
+            duration=duration,
+            sample_rate=sample_rate,
+            bin_edges=bin_edges,
+            capture_rate=capture_rate,
+            frames=frames,
+            version=int(payload.get("version", 1)),
+        )
+
+@dataclass
 class AnalysisSettings:
     """User-tunable knobs for the librosa analysis pipeline."""
 
@@ -136,6 +214,10 @@ class AnalysisSettings:
     pitch_change_percentile: float = 95.0
     onset_backtrack: bool = False
     onset_delta: float = 0.2
+    frequency_bin_count: int = 16
+    frequency_min_hz: float = 20.0
+    frequency_max_hz: float = 20000.0
+    frequency_capture_rate: float = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +234,7 @@ class AudioAnalyzer:
         self.sample_rate: Optional[int] = None
         self.settings = settings or AnalysisSettings()
 
-    def analyse(self) -> TimingDocument:
+    def analyse(self) -> Tuple[TimingDocument, Optional[FrequencyDocument]]:
         try:
             import librosa
             import numpy as np
@@ -243,7 +325,8 @@ class AudioAnalyzer:
             pass
 
         doc = TimingDocument(duration=self.duration, sample_rate=sr, tracks=tracks)
-        return doc
+        frequency_doc = self._compute_frequency_document(y, sr)
+        return doc, frequency_doc
 
     @staticmethod
     def _find_sections(times: Iterable[float], values: Iterable[float], threshold: float) -> List[Tuple[float, float, float]]:
@@ -295,6 +378,76 @@ class AudioAnalyzer:
                 TimingEvent(time=float(t), value=float(mag), label="pitch_change", data={"hz": float(pitch_array[idx])})
             )
         return events
+
+    def _compute_frequency_document(self, samples: Any, sample_rate: int) -> Optional[FrequencyDocument]:
+        try:
+            import librosa
+            import numpy as np
+        except Exception:  # pragma: no cover - librosa already imported earlier
+            return None
+
+        bin_count = max(1, int(self.settings.frequency_bin_count))
+        min_hz = max(1.0, float(self.settings.frequency_min_hz))
+        max_hz = max(min_hz + 1.0, float(self.settings.frequency_max_hz))
+        capture_rate = max(1.0, float(self.settings.frequency_capture_rate))
+        hop_length = max(64, int(sample_rate / capture_rate))
+        n_fft = 1024
+        while n_fft < hop_length * 2:
+            n_fft *= 2
+
+        stft = librosa.stft(samples, n_fft=n_fft, hop_length=hop_length)
+        magnitude = np.abs(stft)
+        if magnitude.size == 0:
+            return None
+        freqs = librosa.fft_frequencies(sr=sample_rate, n_fft=n_fft)
+        times = librosa.frames_to_time(range(magnitude.shape[1]), sr=sample_rate, hop_length=hop_length)
+
+        bin_edges = np.linspace(min_hz, max_hz, bin_count + 1)
+        bin_indices: List[Any] = []
+        freq_array = np.array(freqs)
+        for idx in range(bin_count):
+            start = bin_edges[idx]
+            end = bin_edges[idx + 1]
+            if idx == bin_count - 1:
+                mask = (freq_array >= start) & (freq_array <= end)
+            else:
+                mask = (freq_array >= start) & (freq_array < end)
+            indices = np.where(mask)[0]
+            if indices.size == 0:
+                # fallback to closest frequency bin to keep visualization populated
+                closest = np.argmin(np.abs(freq_array - (start + end) / 2.0))
+                indices = np.array([closest])
+            bin_indices.append(indices)
+
+        raw_levels: List[List[float]] = []
+        max_value = 0.0
+        for frame_idx in range(magnitude.shape[1]):
+            frame_mags = magnitude[:, frame_idx]
+            levels: List[float] = []
+            for indices in bin_indices:
+                value = float(np.mean(frame_mags[indices])) if indices.size else 0.0
+                levels.append(value)
+            max_value = max(max_value, max(levels))
+            raw_levels.append(levels)
+
+        if not raw_levels:
+            return None
+        normaliser = max(max_value, 1e-9)
+        frames = [
+            FrequencyFrame(
+                time=float(time_value),
+                levels=[float((value / normaliser) * 100.0) for value in level_row],
+            )
+            for time_value, level_row in zip(times, raw_levels)
+        ]
+        edge_pairs = [(float(bin_edges[i]), float(bin_edges[i + 1])) for i in range(bin_count)]
+        return FrequencyDocument(
+            duration=float(self.duration),
+            sample_rate=sample_rate,
+            bin_edges=edge_pairs,
+            capture_rate=capture_rate,
+            frames=frames,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -603,6 +756,7 @@ class AudioMapTool:
 
         self.audio_path: Optional[Path] = None
         self.doc: Optional[TimingDocument] = None
+        self.freq_doc: Optional[FrequencyDocument] = None
         self._analysis_thread: Optional[threading.Thread] = None
         self._playback_job: Optional[str] = None
         self._play_start_time = 0.0
@@ -616,6 +770,11 @@ class AudioMapTool:
         self._play_sound: Optional[Any] = None
         self._play_channel: Optional[Any] = None
         self._pygame: Optional[Any] = None
+        self._freq_timing_settings: Dict[str, object] = {
+            "track_name": "frequency_triggers",
+            "bin_index": 0,
+            "sensitivity": 10.0,
+        }
 
         self._build_ui()
 
@@ -647,7 +806,14 @@ class AudioMapTool:
         self.analyse_btn.grid(row=0, column=3, padx=(0, 6))
         ttk.Button(toolbar, text="Analysis settings…", command=self._edit_analysis_settings).grid(row=0, column=4, padx=(0, 6))
         ttk.Button(toolbar, text="Load timing", command=self._load_timing_from_disk).grid(row=0, column=5, padx=(0, 6))
-        ttk.Button(toolbar, text="Save timing", command=self._save_timing).grid(row=0, column=6)
+        ttk.Button(toolbar, text="Save timing", command=self._save_timing).grid(row=0, column=6, padx=(0, 6))
+        self.frequency_btn = ttk.Button(
+            toolbar,
+            text="Timing from frequency",
+            command=self._timing_from_frequency,
+            state="disabled",
+        )
+        self.frequency_btn.grid(row=0, column=7)
 
         self.status_var = tk.StringVar(value="Select an audio file to begin.")
         ttk.Label(toolbar, textvariable=self.status_var).grid(row=1, column=0, columnspan=7, sticky="w", pady=(6, 0))
@@ -670,6 +836,14 @@ class AudioMapTool:
         ttk.Button(sidebar, text="Add track", command=self._add_track).pack(fill="x", pady=(0, 4))
         ttk.Button(sidebar, text="Rename track", command=self._rename_track).pack(fill="x", pady=(0, 4))
         ttk.Button(sidebar, text="Delete track", command=self._delete_track).pack(fill="x")
+
+        ttk.Separator(sidebar, orient="horizontal").pack(fill="x", pady=(12, 6))
+        ttk.Label(sidebar, text="Frequency bins", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        self.freq_bar_container = ttk.Frame(sidebar)
+        self.freq_bar_container.pack(fill="x", pady=(4, 0))
+        self.freq_bar_widgets: List[ttk.Progressbar] = []
+        self.freq_status_var = tk.StringVar(value="Frequency data not loaded.")
+        ttk.Label(sidebar, textvariable=self.freq_status_var, wraplength=180, justify="left").pack(fill="x", pady=(4, 0))
 
         # Timeline ---------------------------------------------------------
         timeline_frame = ttk.Frame(main)
@@ -790,9 +964,14 @@ class AudioMapTool:
         self.analyse_btn.config(state="normal")
         self._reset_audio_buffer()
         self.doc = None
+        self.freq_doc = None
         self.timeline.set_tracks(OrderedDict())
         self.timeline.set_duration(0.0)
         self._load_timing_from_disk(auto=True)
+        self._load_frequency_from_disk(auto=True)
+        self._rebuild_frequency_display()
+        self._update_frequency_button_state()
+        self._update_frequency_display(0.0)
         self.status_var.set("Ready to analyse.")
 
     def _on_zoom(self, _value: str) -> None:
@@ -806,6 +985,7 @@ class AudioMapTool:
         if was_playing:
             self._stop_playback()
         self.timeline.focus_playhead(timestamp)
+        self._update_frequency_display(timestamp)
         self._play_offset = timestamp
         if was_playing:
             if not self._ensure_audio_buffer():
@@ -832,6 +1012,7 @@ class AudioMapTool:
         if start_time >= self.doc.duration:
             start_time = 0.0
             self.timeline.focus_playhead(0.0)
+            self._update_frequency_display(0.0)
         if not self._start_audio_playback(start_time):
             return
         self._log("Playback started from %.3fs", start_time)
@@ -861,10 +1042,12 @@ class AudioMapTool:
         elapsed = time.perf_counter() - self._play_start_time + self._play_offset
         if elapsed >= self.doc.duration:
             self.timeline.focus_playhead(self.doc.duration)
+            self._update_frequency_display(self.doc.duration)
             self._log("Playback reached end of doc (%.3fs)", self.doc.duration)
             self._stop_playback()
             return
         self.timeline.focus_playhead(elapsed)
+        self._update_frequency_display(elapsed)
         self._playback_job = self.root.after(33, self._schedule_playhead)
 
     def _run_analysis(self) -> None:
@@ -879,21 +1062,25 @@ class AudioMapTool:
         def worker() -> None:
             try:
                 analyzer = AudioAnalyzer(audio_path, settings=settings)
-                doc = analyzer.analyse()
+                doc, freq_doc = analyzer.analyse()
             except Exception as exc:
                 self.root.after(0, lambda: self._analysis_failed(exc))
                 return
-            self.root.after(0, lambda: self._analysis_done(doc))
+            self.root.after(0, lambda: self._analysis_done(doc, freq_doc))
 
         self._analysis_thread = threading.Thread(target=worker, daemon=True)
         self._analysis_thread.start()
 
-    def _analysis_done(self, doc: TimingDocument) -> None:
+    def _analysis_done(self, doc: TimingDocument, freq_doc: Optional[FrequencyDocument]) -> None:
         self.doc = doc
+        self.freq_doc = freq_doc
         self.timeline.set_tracks(doc.tracks)
         self.timeline.set_duration(doc.duration)
         self._refresh_track_list()
         self._refresh_event_tree()
+        self._rebuild_frequency_display()
+        self._update_frequency_button_state()
+        self._update_frequency_display()
         self.status_var.set("Analysis complete. Review and edit tracks, then save timing file.")
         self.analyse_btn.config(state="normal")
 
@@ -908,6 +1095,12 @@ class AudioMapTool:
         timing_dir = self.project / "internal" / "timing"
         return timing_dir / f"{self.audio_path.stem}.timing.json"
 
+    def _default_frequency_path(self) -> Optional[Path]:
+        if not self.project or not self.audio_path:
+            return None
+        timing_dir = self.project / "internal" / "timing"
+        return timing_dir / f"{self.audio_path.stem}.frequency.json"
+
     def _load_timing_from_disk(self, auto: bool = False) -> None:
         timing_path = self._default_timing_path()
         if not timing_path or not timing_path.exists():
@@ -921,9 +1114,30 @@ class AudioMapTool:
             self.timeline.set_duration(self.doc.duration)
             self._refresh_track_list()
             self._refresh_event_tree()
+            self._update_frequency_button_state()
+            self._load_frequency_from_disk(auto=True)
             self.status_var.set(f"Loaded timing from {timing_path.name}.")
         except Exception as exc:
             messagebox.showerror("Load failed", f"Could not read timing file: {exc}")
+
+    def _load_frequency_from_disk(self, auto: bool = False) -> None:
+        freq_path = self._default_frequency_path()
+        if not freq_path or not freq_path.exists():
+            if not auto:
+                messagebox.showinfo("Frequency data", "No frequency file found for this audio yet.")
+            self.freq_doc = None
+            self._rebuild_frequency_display()
+            self._update_frequency_button_state()
+            return
+        try:
+            data = json.loads(freq_path.read_text())
+            self.freq_doc = FrequencyDocument.from_dict(data)
+            self._rebuild_frequency_display()
+            self._update_frequency_display()
+            self._update_frequency_button_state()
+            self.status_var.set(f"Loaded frequency data from {freq_path.name}.")
+        except Exception as exc:
+            messagebox.showerror("Load failed", f"Could not read frequency file: {exc}")
 
     def _save_timing(self) -> None:
         if not self.doc or not self.audio_path:
@@ -938,14 +1152,21 @@ class AudioMapTool:
         timing_path.parent.mkdir(parents=True, exist_ok=True)
         with timing_path.open("w", encoding="utf-8") as fh:
             json.dump(self.doc.to_dict(), fh, indent=2)
-        if self.project:
-            try:
-                relative_path = timing_path.relative_to(self.project)
-            except ValueError:
-                relative_path = timing_path
-        else:
-            relative_path = timing_path
-        self.status_var.set(f"Saved timing to {relative_path}.")
+        freq_path = self._save_frequency_data(reference_path=timing_path)
+
+        def _relative(path: Path) -> Path:
+            if self.project:
+                try:
+                    return path.relative_to(self.project)
+                except ValueError:
+                    return path
+            return path
+
+        status = f"Saved timing to {_relative(timing_path)}"
+        if freq_path:
+            status += f" and frequency data to {_relative(freq_path)}"
+        status += "."
+        self.status_var.set(status)
 
     def _reset_audio_buffer(self) -> None:
         self._log("Resetting audio buffer")
@@ -954,6 +1175,22 @@ class AudioMapTool:
         self._audio_samplerate = 0
         self._audio_channels = 0
         self._play_buffer_bytes = None
+
+    def _save_frequency_data(self, reference_path: Optional[Path] = None) -> Optional[Path]:
+        if not self.freq_doc:
+            return None
+        freq_path = self._default_frequency_path()
+        if not freq_path:
+            if reference_path:
+                freq_path = reference_path.with_name(f"{reference_path.stem}.frequency.json")
+            elif self.audio_path:
+                freq_path = self.audio_path.with_suffix(".frequency.json")
+            else:
+                return None
+        freq_path.parent.mkdir(parents=True, exist_ok=True)
+        with freq_path.open("w", encoding="utf-8") as fh:
+            json.dump(self.freq_doc.to_dict(), fh, indent=2)
+        return freq_path
 
     def _edit_analysis_settings(self) -> None:
         dialog = tk.Toplevel(self.root)
@@ -989,8 +1226,24 @@ class AudioMapTool:
         backtrack_var = tk.BooleanVar(value=self.analysis_settings.onset_backtrack)
         ttk.Checkbutton(dialog, text="Backtrack onsets", variable=backtrack_var).grid(row=6, column=0, columnspan=2, sticky="w", padx=6, pady=(4, 8))
 
+        ttk.Label(dialog, text="Frequency bins").grid(row=7, column=0, sticky="w", padx=6, pady=4)
+        freq_bins_var = tk.StringVar(value=str(self.analysis_settings.frequency_bin_count))
+        ttk.Entry(dialog, textvariable=freq_bins_var).grid(row=7, column=1, padx=6, pady=4)
+
+        ttk.Label(dialog, text="Frequency min (Hz)").grid(row=8, column=0, sticky="w", padx=6, pady=4)
+        freq_min_var = tk.StringVar(value=str(self.analysis_settings.frequency_min_hz))
+        ttk.Entry(dialog, textvariable=freq_min_var).grid(row=8, column=1, padx=6, pady=4)
+
+        ttk.Label(dialog, text="Frequency max (Hz)").grid(row=9, column=0, sticky="w", padx=6, pady=4)
+        freq_max_var = tk.StringVar(value=str(self.analysis_settings.frequency_max_hz))
+        ttk.Entry(dialog, textvariable=freq_max_var).grid(row=9, column=1, padx=6, pady=4)
+
+        ttk.Label(dialog, text="Frequency capture rate (samples/s)").grid(row=10, column=0, sticky="w", padx=6, pady=4)
+        freq_capture_var = tk.StringVar(value=str(self.analysis_settings.frequency_capture_rate))
+        ttk.Entry(dialog, textvariable=freq_capture_var).grid(row=10, column=1, padx=6, pady=4)
+
         button_frame = ttk.Frame(dialog)
-        button_frame.grid(row=7, column=0, columnspan=2, pady=(0, 8))
+        button_frame.grid(row=11, column=0, columnspan=2, pady=(0, 8))
 
         def on_ok() -> None:
             try:
@@ -1004,6 +1257,10 @@ class AudioMapTool:
                 rms_percentile = max(0.0, min(100.0, float(rms_var.get())))
                 pitch_percentile = max(0.0, min(100.0, float(pitch_var.get())))
                 onset_delta = float(onset_delta_var.get())
+                freq_bins = max(1, int(freq_bins_var.get()))
+                freq_min = max(1.0, float(freq_min_var.get()))
+                freq_max = max(freq_min + 1.0, float(freq_max_var.get()))
+                freq_capture = max(1.0, float(freq_capture_var.get()))
             except ValueError:
                 messagebox.showerror("Invalid value", "Please enter numeric values for all settings.", parent=dialog)
                 return
@@ -1015,6 +1272,10 @@ class AudioMapTool:
                 pitch_change_percentile=pitch_percentile,
                 onset_backtrack=backtrack_var.get(),
                 onset_delta=onset_delta,
+                frequency_bin_count=freq_bins,
+                frequency_min_hz=freq_min,
+                frequency_max_hz=freq_max,
+                frequency_capture_rate=freq_capture,
             )
             self.status_var.set("Updated analysis settings.")
             dialog.destroy()
@@ -1198,6 +1459,48 @@ class AudioMapTool:
             )
         self.timeline.set_tracks(self.doc.tracks)
         self.timeline.set_duration(self.doc.duration)
+        self._update_frequency_button_state()
+
+    def _rebuild_frequency_display(self) -> None:
+        if not hasattr(self, "freq_bar_container"):
+            return
+        for child in self.freq_bar_container.winfo_children():
+            child.destroy()
+        self.freq_bar_widgets = []
+        freq_doc = self.freq_doc
+        if not freq_doc or not freq_doc.bin_count:
+            self.freq_status_var.set("Frequency data not loaded.")
+            return
+        for idx, (start, end) in enumerate(freq_doc.bin_edges):
+            bar_frame = ttk.Frame(self.freq_bar_container)
+            bar_frame.pack(side=tk.LEFT, padx=2)
+            bar = ttk.Progressbar(bar_frame, orient="vertical", length=80, mode="determinate", maximum=100)
+            bar.pack(fill="y")
+            label_text = f"Bin {idx + 1}\n{int(start)}-{int(end)} Hz"
+            ttk.Label(bar_frame, text=label_text, font=("Segoe UI", 7), justify="center").pack(pady=(2, 0))
+            self.freq_bar_widgets.append(bar)
+        self.freq_status_var.set(
+            f"{freq_doc.bin_count} bins • {freq_doc.capture_rate:.1f} samples/s"
+        )
+
+    def _update_frequency_display(self, timestamp: Optional[float] = None) -> None:
+        if not hasattr(self, "freq_bar_widgets"):
+            return
+        if not self.freq_doc or not self.freq_bar_widgets:
+            return
+        if timestamp is None:
+            timestamp = self.timeline.current_playhead_time if hasattr(self, "timeline") else 0.0
+        levels = self.freq_doc.levels_at(timestamp)
+        for bar, level in zip(self.freq_bar_widgets, levels):
+            bar["value"] = max(0.0, min(100.0, level))
+
+    def _update_frequency_button_state(self) -> None:
+        if not hasattr(self, "frequency_btn"):
+            return
+        if self.doc and self.freq_doc:
+            self.frequency_btn.config(state="normal")
+        else:
+            self.frequency_btn.config(state="disabled")
 
     @property
     def _selected_track_name(self) -> Optional[str]:
@@ -1470,7 +1773,113 @@ class AudioMapTool:
         event = track.events[idx]
         timestamp = event.time
         self.timeline.focus_playhead(timestamp)
+        self._update_frequency_display(timestamp)
         self._update_event_form(event)
+
+    def _timing_from_frequency(self) -> None:
+        if not self.doc or not self.freq_doc:
+            messagebox.showinfo("Frequency unavailable", "Analyse audio with frequency capture first.")
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Timing from frequency")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        ttk.Label(dialog, text="Track name").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        track_var = tk.StringVar(value=str(self._freq_timing_settings.get("track_name", "frequency_triggers")))
+        ttk.Entry(dialog, textvariable=track_var).grid(row=0, column=1, padx=6, pady=4)
+
+        ttk.Label(dialog, text="Frequency bin").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        bin_descriptions = [
+            f"Bin {idx + 1}: {int(start)}-{int(end)} Hz"
+            for idx, (start, end) in enumerate(self.freq_doc.bin_edges)
+        ]
+        bin_var = tk.StringVar()
+        bin_combo = ttk.Combobox(dialog, values=bin_descriptions, state="readonly", textvariable=bin_var, width=28)
+        default_bin = min(len(bin_descriptions) - 1, int(self._freq_timing_settings.get("bin_index", 0))) if bin_descriptions else 0
+        if bin_descriptions:
+            bin_combo.current(default_bin)
+        bin_combo.grid(row=1, column=1, padx=6, pady=4)
+
+        ttk.Label(dialog, text="Sensitivity (percentage change)").grid(row=2, column=0, sticky="w", padx=6, pady=4)
+        sensitivity_var = tk.StringVar(value=str(self._freq_timing_settings.get("sensitivity", 10.0)))
+        ttk.Entry(dialog, textvariable=sensitivity_var).grid(row=2, column=1, padx=6, pady=4)
+
+        button_frame = ttk.Frame(dialog)
+        button_frame.grid(row=3, column=0, columnspan=2, pady=(6, 8))
+
+        def on_ok() -> None:
+            track_name = track_var.get().strip() or f"frequency_bin_{default_bin + 1}"
+            if not bin_descriptions:
+                messagebox.showerror("No bins", "Frequency capture does not contain any bins.", parent=dialog)
+                return
+            selected_index = bin_combo.current()
+            if selected_index < 0:
+                selected_index = 0
+            try:
+                sensitivity = max(0.0, float(sensitivity_var.get()))
+            except ValueError:
+                messagebox.showerror("Invalid sensitivity", "Sensitivity must be numeric.", parent=dialog)
+                return
+            events = self._build_frequency_events(selected_index, sensitivity)
+            if not events:
+                messagebox.showinfo("No events", "No changes exceeded the selected sensitivity.", parent=dialog)
+                return
+            track = self.doc.tracks.get(track_name)
+            if track and track.events:
+                if not messagebox.askyesno("Replace events", f"Replace existing events in '{track_name}'?", parent=dialog):
+                    return
+                track.events = events
+            else:
+                track = self.doc.ensure_track(track_name)
+                track.events = events
+            track.sort_events()
+            self._refresh_track_list()
+            self._refresh_event_tree()
+            self._freq_timing_settings = {
+                "track_name": track_name,
+                "bin_index": selected_index,
+                "sensitivity": sensitivity,
+            }
+            start, end = self.freq_doc.bin_edges[selected_index]
+            self.status_var.set(
+                f"Created {len(events)} events from bin {selected_index + 1} ({int(start)}-{int(end)} Hz)."
+            )
+            dialog.destroy()
+
+        ttk.Button(button_frame, text="Create", command=on_ok).pack(side=tk.LEFT, padx=6)
+        ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=6)
+        dialog.wait_window()
+
+    def _build_frequency_events(self, bin_index: int, sensitivity: float) -> List[TimingEvent]:
+        if not self.freq_doc or not self.freq_doc.frames:
+            return []
+        events: List[TimingEvent] = []
+        frames = self.freq_doc.frames
+        if not frames:
+            return []
+        prev_level = frames[0].levels[bin_index] if bin_index < len(frames[0].levels) else 0.0
+        for frame in frames[1:]:
+            if bin_index >= len(frame.levels):
+                continue
+            level = frame.levels[bin_index]
+            if abs(level - prev_level) >= sensitivity:
+                start, end = self.freq_doc.bin_edges[bin_index]
+                events.append(
+                    TimingEvent(
+                        time=float(frame.time),
+                        value=float(level),
+                        label="frequency_trigger",
+                        data={
+                            "bin": bin_index,
+                            "range": [float(start), float(end)],
+                            "change": float(level - prev_level),
+                        },
+                    )
+                )
+            prev_level = level
+        return events
 
 
 # ---------------------------------------------------------------------------

@@ -694,6 +694,141 @@ class RenderPlan:
         return np.array(image, dtype=np.uint8)
 
 
+class FrequencyWavesEffect(VisualEffect):
+    def __init__(
+        self,
+        freq_doc: FrequencyDocument,
+        bin_indices: list[int],
+        duration: float,
+        canvas_size: tuple[int, int],
+        fps: int,
+        options: Dict[str, Any],
+    ) -> None:
+        super().__init__(0.0, duration)
+        self.freq_doc = freq_doc
+        self.bin_indices = [max(0, int(idx)) for idx in bin_indices] or [0]
+        self.width, self.height = canvas_size
+        self.fps = max(1, int(fps))
+        self.opacity = max(0.0, min(1.0, float(options.get("opacity", 1.0))))
+        self.future_steps = max(1, int(options.get("future_steps", 20)))
+        self.horizon_percent = max(0.05, min(0.95, float(options.get("horizon_percent", 0.5))))
+        self.bottom_offset = max(0.0, min(0.9, float(options.get("bottom_offset", 0.0))))
+        self.crash_method = str(options.get("crash_method", "vanish")).lower()
+        self.base_color = self._parse_color(options.get("color", "80,180,255"))
+        self.highlight_color = self._parse_color(options.get("highlight_color", "200,230,255"))
+        if self.freq_doc.capture_rate:
+            self.time_step = 1.0 / float(self.freq_doc.capture_rate)
+        elif self.freq_doc.frames:
+            self.time_step = max(1.0 / self.fps, self.freq_doc.duration / max(len(self.freq_doc.frames), 1))
+        else:
+            self.time_step = 1.0 / self.fps
+        self.wave_state: dict[int, dict[str, Any]] = {
+            idx: {"crash_particles": []} for idx in self.bin_indices
+        }
+
+    def _parse_color(self, value: Any) -> tuple[int, int, int, int]:
+        try:
+            if isinstance(value, (list, tuple)) and len(value) >= 3:
+                r, g, b = value[:3]
+            else:
+                parts = str(value).split(",")
+                r, g, b = (int(float(parts[i])) for i in range(3))
+            r = max(0, min(255, int(r)))
+            g = max(0, min(255, int(g)))
+            b = max(0, min(255, int(b)))
+        except Exception:
+            r, g, b = 80, 180, 255
+        alpha = int(255 * self.opacity)
+        return (r, g, b, alpha)
+
+    def _sample_level(self, time_s: float, bin_index: int, offset_idx: int) -> float:
+        timestamp = time_s + offset_idx * self.time_step
+        return self.freq_doc.level_at(timestamp, bin_index)
+
+    def _draw_wave_band(
+        self,
+        draw: ImageDraw.ImageDraw,
+        band: tuple[float, float, float, float],
+        color: tuple[int, int, int, int],
+        highlight: tuple[int, int, int, int],
+    ) -> None:
+        x0, x1, crest_y, base_y = band
+        thickness = max(2.0, (base_y - crest_y) * 0.35)
+        body_color = color[:3] + (color[3],)
+        draw.rectangle((x0, crest_y, x1, base_y), fill=body_color)
+        draw.line((x0, crest_y, x1, crest_y), fill=highlight, width=int(max(1, thickness)))
+
+    def _spawn_break_particles(self, bin_index: int, x_range: tuple[float, float], y_pos: float, intensity: float) -> None:
+        particles = self.wave_state.setdefault(bin_index, {}).setdefault("crash_particles", [])
+        count = max(1, int(3 + intensity * 6))
+        for _ in range(count):
+            particles.append(
+                {
+                    "x": random.uniform(*x_range),
+                    "y": y_pos,
+                    "vy": random.uniform(6.0, 14.0) * (0.5 + intensity),
+                    "radius": random.uniform(2.0, 4.0),
+                    "alpha": int(self.base_color[3] * 0.5),
+                }
+            )
+
+    def _draw_particles(self, draw: ImageDraw.ImageDraw, bin_index: int) -> None:
+        particles = self.wave_state.setdefault(bin_index, {}).setdefault("crash_particles", [])
+        remaining = []
+        for particle in particles:
+            particle["y"] += particle["vy"]
+            particle["vy"] *= 0.9
+            particle["alpha"] = max(0, int(particle["alpha"] * 0.8))
+            if particle["y"] >= self.height or particle["alpha"] <= 2:
+                continue
+            radius = particle["radius"]
+            alpha = particle["alpha"]
+            x0 = particle["x"] - radius
+            y0 = particle["y"] - radius
+            x1 = particle["x"] + radius
+            y1 = particle["y"] + radius
+            color = self.base_color[:3] + (alpha,)
+            draw.ellipse((x0, y0, x1, y1), fill=color)
+            remaining.append(particle)
+        self.wave_state[bin_index]["crash_particles"] = remaining
+
+    def draw(self, image: Image.Image, time_s: float) -> None:  # pragma: no cover - visual output
+        draw = ImageDraw.Draw(image, "RGBA")
+        count = max(1, len(self.bin_indices))
+        segment_width = self.width / count
+        horizon_y = self.height * (1.0 - self.horizon_percent)
+        beach_y = self.height * (1.0 - self.bottom_offset)
+        beach_y = min(self.height, max(horizon_y + 1, beach_y))
+        depth_range = max(1.0, beach_y - horizon_y)
+        for position, bin_index in enumerate(self.bin_indices):
+            x_start = position * segment_width
+            x_end = x_start + segment_width
+            for offset in reversed(range(self.future_steps + 1)):
+                depth_ratio = offset / float(self.future_steps)
+                y_pos = horizon_y + depth_range * (1 - depth_ratio)
+                level = self._sample_level(time_s, bin_index, offset)
+                intensity = max(0.0, min(1.0, level / 100.0))
+                crest_height = self.height * 0.28 * (0.4 + 0.6 * (1 - depth_ratio)) * intensity
+                crest_y = y_pos - crest_height
+                band = (x_start + 2, x_end - 2, crest_y, y_pos)
+                color = self.base_color
+                highlight = self.highlight_color
+                if intensity > 0.85:
+                    boost = min(1.0, (intensity - 0.85) / 0.15)
+                    color = tuple(min(255, int(c + (255 - c) * 0.35 * boost)) for c in color[:3]) + (color[3],)
+                    highlight = tuple(min(255, int(h + (255 - h) * 0.5 * boost)) for h in highlight[:3]) + (highlight[3],)
+                self._draw_wave_band(draw, band, color, highlight)
+                if offset == 0 and intensity > 0.02:
+                    if self.crash_method == "break":
+                        self._spawn_break_particles(bin_index, (x_start, x_end), y_pos - crest_height * 0.4, intensity)
+                    elif self.crash_method == "fall":
+                        fall_height = crest_height * 0.8
+                        shade = color[:3] + (int(color[3] * 0.5),)
+                        draw.rectangle((x_start + 4, y_pos, x_end - 4, min(self.height, y_pos + fall_height)), fill=shade)
+            if self.crash_method == "break":
+                self._draw_particles(draw, bin_index)
+
+
 # ---------------------------------------------------------------------------
 # GUI components
 # ---------------------------------------------------------------------------
@@ -938,6 +1073,15 @@ class FrequencyAssociationDialog(simpledialog.Dialog):
             r, g, b = map(int, rgb)
             target_var.set(f"{r},{g},{b}")
 
+    def _on_mode_change(self, _event=None) -> None:
+        mode = self.mode_var.get().lower()
+        if mode == "waves":
+            self.eq_frame.grid_remove()
+            self.waves_frame.grid()
+        else:
+            self.waves_frame.grid_remove()
+            self.eq_frame.grid()
+
     def body(self, master):
         bin_labels = self._bin_labels()
         defaults = []
@@ -961,66 +1105,99 @@ class FrequencyAssociationDialog(simpledialog.Dialog):
         ttk.Label(master, text="Mode:").grid(row=1, column=0, sticky="w", pady=(8, 0))
         default_mode = (self.config.mode.upper() if self.config else "EQ")
         self.mode_var = tk.StringVar(value=default_mode)
-        ttk.Combobox(master, values=["EQ"], textvariable=self.mode_var, state="readonly").grid(
-            row=1, column=1, sticky="ew", pady=(8, 0)
-        )
+        mode_combo = ttk.Combobox(master, values=["EQ", "WAVES"], textvariable=self.mode_var, state="readonly")
+        mode_combo.grid(row=1, column=1, sticky="ew", pady=(8, 0))
+        mode_combo.bind("<<ComboboxSelected>>", self._on_mode_change)
 
         options = self.config.options if self.config else {}
-        ttk.Label(master, text="Opacity (0-1):").grid(row=2, column=0, sticky="w", pady=(10, 0))
         self.opacity_var = tk.StringVar(value=str(options.get("opacity", 1.0)))
-        ttk.Entry(master, textvariable=self.opacity_var, width=12).grid(row=2, column=1, sticky="w", pady=(10, 0))
-
-        ttk.Label(master, text="Gap (px):").grid(row=3, column=0, sticky="w", pady=(6, 0))
-        self.gap_var = tk.StringVar(value=str(options.get("gap", 3)))
-        ttk.Entry(master, textvariable=self.gap_var, width=12).grid(row=3, column=1, sticky="w", pady=(6, 0))
-
-        ttk.Label(master, text="Bar width (px):").grid(row=4, column=0, sticky="w", pady=(6, 0))
-        self.bar_width_var = tk.StringVar(value=str(options.get("bar_width", int(self.gap_var.get() or 3) * 2)))
-        ttk.Entry(master, textvariable=self.bar_width_var, width=12).grid(row=4, column=1, sticky="w", pady=(6, 0))
-
-        ttk.Label(master, text="EQ height (0-1):").grid(row=5, column=0, sticky="w", pady=(6, 0))
-        self.eq_height_var = tk.StringVar(value=str(options.get("eq_height", 1.0)))
-        ttk.Entry(master, textvariable=self.eq_height_var, width=12).grid(row=5, column=1, sticky="w", pady=(6, 0))
-
-        ttk.Label(master, text="Color (R,G,B):").grid(row=6, column=0, sticky="w", pady=(6, 0))
         self.color_var = tk.StringVar(value=str(options.get("color", "0,255,0")))
-        color_row = ttk.Frame(master)
-        color_row.grid(row=6, column=1, sticky="w", pady=(6, 0))
+
+        self.eq_frame = ttk.LabelFrame(master, text="EQ options")
+        self.eq_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(self.eq_frame, text="Opacity (0-1):").grid(row=0, column=0, sticky="w", pady=(2, 0))
+        ttk.Entry(self.eq_frame, textvariable=self.opacity_var, width=12).grid(row=0, column=1, sticky="w", pady=(2, 0))
+
+        ttk.Label(self.eq_frame, text="Gap (px):").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.gap_var = tk.StringVar(value=str(options.get("gap", 3)))
+        ttk.Entry(self.eq_frame, textvariable=self.gap_var, width=12).grid(row=1, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(self.eq_frame, text="Bar width (px):").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.bar_width_var = tk.StringVar(value=str(options.get("bar_width", int(self.gap_var.get() or 3) * 2)))
+        ttk.Entry(self.eq_frame, textvariable=self.bar_width_var, width=12).grid(row=2, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(self.eq_frame, text="EQ height (0-1):").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        self.eq_height_var = tk.StringVar(value=str(options.get("eq_height", 1.0)))
+        ttk.Entry(self.eq_frame, textvariable=self.eq_height_var, width=12).grid(row=3, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(self.eq_frame, text="Color (R,G,B):").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        color_row = ttk.Frame(self.eq_frame)
+        color_row.grid(row=4, column=1, sticky="w", pady=(6, 0))
         ttk.Entry(color_row, textvariable=self.color_var, width=14).pack(side="left")
         ttk.Button(color_row, text="Pick", command=lambda: self._pick_color(self.color_var)).pack(side="left", padx=(6, 0))
 
-        ttk.Label(master, text="Fade frames:").grid(row=7, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(self.eq_frame, text="Fade frames:").grid(row=5, column=0, sticky="w", pady=(6, 0))
         self.fade_frames_var = tk.StringVar(value=str(options.get("fade_frames", 8)))
-        ttk.Entry(master, textvariable=self.fade_frames_var, width=12).grid(row=7, column=1, sticky="w", pady=(6, 0))
+        ttk.Entry(self.eq_frame, textvariable=self.fade_frames_var, width=12).grid(row=5, column=1, sticky="w", pady=(6, 0))
 
-        ttk.Label(master, text="Jump threshold (%):").grid(row=8, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(self.eq_frame, text="Jump threshold (%):").grid(row=6, column=0, sticky="w", pady=(6, 0))
         self.jump_threshold_var = tk.StringVar(
             value=str(options.get("jump_threshold_percent", options.get("jump_percent", 0.0)))
         )
-        ttk.Entry(master, textvariable=self.jump_threshold_var, width=12).grid(row=8, column=1, sticky="w", pady=(6, 0))
+        ttk.Entry(self.eq_frame, textvariable=self.jump_threshold_var, width=12).grid(row=6, column=1, sticky="w", pady=(6, 0))
 
-        ttk.Label(master, text="Jump window (s):").grid(row=9, column=0, sticky="w", pady=(6, 0))
-        self.jump_window_var = tk.StringVar(
-            value=str(options.get("jump_window_seconds", options.get("jump_time", 0.0)))
-        )
-        ttk.Entry(master, textvariable=self.jump_window_var, width=12).grid(row=9, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(self.eq_frame, text="Jump window (s):").grid(row=7, column=0, sticky="w", pady=(6, 0))
+        self.jump_window_var = tk.StringVar(value=str(options.get("jump_window_seconds", options.get("jump_time", 0.0))))
+        ttk.Entry(self.eq_frame, textvariable=self.jump_window_var, width=12).grid(row=7, column=1, sticky="w", pady=(6, 0))
 
-        ttk.Label(master, text="Jump sustain (frames):").grid(row=10, column=0, sticky="w", pady=(6, 0))
-        self.jump_sustain_var = tk.StringVar(
-            value=str(options.get("jump_sustain_frames", options.get("jump_sustain", 0)))
-        )
-        ttk.Entry(master, textvariable=self.jump_sustain_var, width=12).grid(row=10, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(self.eq_frame, text="Jump sustain (frames):").grid(row=8, column=0, sticky="w", pady=(6, 0))
+        self.jump_sustain_var = tk.StringVar(value=str(options.get("jump_sustain_frames", options.get("jump_sustain", 0))))
+        ttk.Entry(self.eq_frame, textvariable=self.jump_sustain_var, width=12).grid(row=8, column=1, sticky="w", pady=(6, 0))
 
-        ttk.Label(master, text="Jump color (R,G,B):").grid(row=11, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(self.eq_frame, text="Jump color (R,G,B):").grid(row=9, column=0, sticky="w", pady=(6, 0))
         self.jump_color_var = tk.StringVar(value=str(options.get("jump_color", "255,80,80")))
-        jump_color_row = ttk.Frame(master)
-        jump_color_row.grid(row=11, column=1, sticky="w", pady=(6, 0))
+        jump_color_row = ttk.Frame(self.eq_frame)
+        jump_color_row.grid(row=9, column=1, sticky="w", pady=(6, 0))
         ttk.Entry(jump_color_row, textvariable=self.jump_color_var, width=14).pack(side="left")
-        ttk.Button(
-            jump_color_row,
-            text="Pick",
-            command=lambda: self._pick_color(self.jump_color_var),
-        ).pack(side="left", padx=(6, 0))
+        ttk.Button(jump_color_row, text="Pick", command=lambda: self._pick_color(self.jump_color_var)).pack(side="left", padx=(6, 0))
+
+        self.waves_frame = ttk.LabelFrame(master, text="Waves options")
+        self.waves_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(self.waves_frame, text="Opacity (0-1):").grid(row=0, column=0, sticky="w", pady=(2, 0))
+        ttk.Entry(self.waves_frame, textvariable=self.opacity_var, width=12).grid(row=0, column=1, sticky="w", pady=(2, 0))
+
+        ttk.Label(self.waves_frame, text="Future steps:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.wave_depth_var = tk.StringVar(value=str(options.get("future_steps", 20)))
+        ttk.Entry(self.waves_frame, textvariable=self.wave_depth_var, width=12).grid(row=1, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(self.waves_frame, text="Horizon (% from bottom):").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.wave_horizon_var = tk.StringVar(value=str(options.get("horizon_percent", 0.5)))
+        ttk.Entry(self.waves_frame, textvariable=self.wave_horizon_var, width=12).grid(row=2, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(self.waves_frame, text="Bottom offset (0-1):").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        self.wave_bottom_offset_var = tk.StringVar(value=str(options.get("bottom_offset", 0.0)))
+        ttk.Entry(self.waves_frame, textvariable=self.wave_bottom_offset_var, width=12).grid(row=3, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(self.waves_frame, text="Crash method:").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        self.crash_method_var = tk.StringVar(value=str(options.get("crash_method", "vanish")).lower())
+        ttk.Combobox(
+            self.waves_frame,
+            values=["vanish", "fall", "break"],
+            textvariable=self.crash_method_var,
+            state="readonly",
+            width=12,
+        ).grid(row=4, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(self.waves_frame, text="Wave color (R,G,B):").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        self.wave_color_var = tk.StringVar(value=str(options.get("color", "80,180,255")))
+        ttk.Entry(self.waves_frame, textvariable=self.wave_color_var, width=14).grid(row=5, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(self.waves_frame, text="Highlight color (R,G,B):").grid(row=6, column=0, sticky="w", pady=(6, 0))
+        self.wave_highlight_var = tk.StringVar(value=str(options.get("highlight_color", "200,230,255")))
+        ttk.Entry(self.waves_frame, textvariable=self.wave_highlight_var, width=14).grid(row=6, column=1, sticky="w", pady=(6, 0))
+
+        self._on_mode_change()
+        return bins_frame
 
     def validate(self) -> bool:
         if not self.freq_doc or not self.freq_doc.bin_edges:
@@ -1029,31 +1206,63 @@ class FrequencyAssociationDialog(simpledialog.Dialog):
         if not any(var.get() for var in getattr(self, "bin_vars", [])):
             messagebox.showerror("Frequency data", "Select at least one frequency bin.")
             return False
+        try:
+            float(self.opacity_var.get() or 1.0)
+            mode = self.mode_var.get().lower()
+            if mode == "waves":
+                int(self.wave_depth_var.get() or 1)
+                float(self.wave_horizon_var.get() or 0.5)
+                float(self.wave_bottom_offset_var.get() or 0.0)
+            else:
+                int(self.gap_var.get() or 3)
+                int(self.bar_width_var.get() or 2)
+                float(self.eq_height_var.get() or 1.0)
+                int(self.fade_frames_var.get() or 0)
+                float(self.jump_threshold_var.get() or 0.0)
+                float(self.jump_window_var.get() or 0.0)
+                int(self.jump_sustain_var.get() or 0)
+        except Exception:
+            messagebox.showerror("Frequency data", "Please enter valid numeric values.")
+            return False
         return True
 
     def apply(self) -> None:
         selected_bins = [idx for idx, var in enumerate(self.bin_vars) if var.get()]
         bin_index = selected_bins[0] if len(selected_bins) == 1 else None
-        options = {
-            "opacity": float(self.opacity_var.get() or 1.0),
-            "gap": int(self.gap_var.get() or 3),
-            "color": self.color_var.get() or "0,255,0",
-            "bar_width": int(self.bar_width_var.get() or (int(self.gap_var.get() or 3) * 2)),
-            "eq_height": float(self.eq_height_var.get() or 1.0),
-            "bin_index": bin_index,
-            "bin_indices": selected_bins,
-            "fade_frames": int(self.fade_frames_var.get() or 8),
-            "jump_threshold_percent": float(self.jump_threshold_var.get() or 0.0),
-            "jump_window_seconds": float(self.jump_window_var.get() or 0.0),
-            "jump_sustain_frames": int(self.jump_sustain_var.get() or 0),
-            "jump_color": self.jump_color_var.get() or "255,80,80",
-        }
+        mode = self.mode_var.get().lower()
+        if mode == "waves":
+            options = {
+                "opacity": float(self.opacity_var.get() or 1.0),
+                "bin_index": bin_index,
+                "bin_indices": selected_bins,
+                "future_steps": int(self.wave_depth_var.get() or 20),
+                "horizon_percent": float(self.wave_horizon_var.get() or 0.5),
+                "bottom_offset": float(self.wave_bottom_offset_var.get() or 0.0),
+                "crash_method": self.crash_method_var.get() or "vanish",
+                "color": self.wave_color_var.get() or "80,180,255",
+                "highlight_color": self.wave_highlight_var.get() or "200,230,255",
+            }
+        else:
+            options = {
+                "opacity": float(self.opacity_var.get() or 1.0),
+                "gap": int(self.gap_var.get() or 3),
+                "color": self.color_var.get() or "0,255,0",
+                "bar_width": int(self.bar_width_var.get() or (int(self.gap_var.get() or 3) * 2)),
+                "eq_height": float(self.eq_height_var.get() or 1.0),
+                "bin_index": bin_index,
+                "bin_indices": selected_bins,
+                "fade_frames": int(self.fade_frames_var.get() or 8),
+                "jump_threshold_percent": float(self.jump_threshold_var.get() or 0.0),
+                "jump_window_seconds": float(self.jump_window_var.get() or 0.0),
+                "jump_sustain_frames": int(self.jump_sustain_var.get() or 0),
+                "jump_color": self.jump_color_var.get() or "255,80,80",
+            }
         labels = self._bin_labels()
         label_parts = [labels[idx] for idx in selected_bins if idx < len(labels)]
         label = ", ".join(label_parts) if label_parts else labels[0]
         self.result_config = AssociationConfig(
             track_name=label,
-            mode=self.mode_var.get().lower(),
+            mode=mode,
             options=options,
             source="frequency",
             bin_index=bin_index,
@@ -1705,14 +1914,24 @@ class TimedActionTool(tk.Tk):
                     if bin_index is None:
                         bin_index = int(assoc.options.get("bin_index", 0))
                     bin_indices = [bin_index]
-                effect = FrequencyEQEffect(
-                    freq_doc=self.frequency_doc,
-                    bin_indices=list(bin_indices),
-                    duration=duration,
-                    canvas_size=(render_settings.width, render_settings.height),
-                    fps=render_settings.fps,
-                    options=assoc.options,
-                )
+                if assoc.mode == "waves":
+                    effect: VisualEffect = FrequencyWavesEffect(
+                        freq_doc=self.frequency_doc,
+                        bin_indices=list(bin_indices),
+                        duration=duration,
+                        canvas_size=(render_settings.width, render_settings.height),
+                        fps=render_settings.fps,
+                        options=assoc.options,
+                    )
+                else:
+                    effect = FrequencyEQEffect(
+                        freq_doc=self.frequency_doc,
+                        bin_indices=list(bin_indices),
+                        duration=duration,
+                        canvas_size=(render_settings.width, render_settings.height),
+                        fps=render_settings.fps,
+                        options=assoc.options,
+                    )
                 associations.append(AssociationPlan(config=assoc, effects=[effect]))
                 continue
 

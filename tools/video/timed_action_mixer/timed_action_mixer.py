@@ -366,6 +366,115 @@ class SpritePopEffect(VisualEffect):
         image.paste(sprite_img, box=top_left, mask=sprite_img)
 
 
+class ZigZagEffect(VisualEffect):
+    def __init__(
+        self,
+        event: TimingEvent,
+        fps: int,
+        canvas_size: tuple[int, int],
+        rng: random.Random,
+        options: Dict[str, Any],
+    ) -> None:
+        self.event_time = float(event.time)
+        fade_frames = max(0, int(options.get("fade", 12)))
+        self.fade_time = fade_frames / fps if fps > 0 else 0.0
+        start = self.event_time
+        end = self.event_time + self.fade_time
+        super().__init__(start, end)
+        self.width, self.height = canvas_size
+        base_color = self._parse_color(options.get("color", (100, 200, 100)))
+        color_variance = float(options.get("color_variance", 10))
+        base_line_width = float(options.get("line_width", 2.0))
+        line_width_variance = float(options.get("line_width_variance", 0.0))
+        base_bar_width = float(options.get("bar_width", 25.0))
+        bar_width_variance = float(options.get("bar_width_variance", 0.0))
+        self.amount = max(1, int(options.get("amount", 1)))
+        alignment = str(options.get("alignment", "both")).lower()
+        self.alignment_options = {alignment} if alignment in {"horizontal", "vertical"} else {"horizontal", "vertical"}
+
+        self.lines: list[dict[str, Any]] = []
+        for _ in range(self.amount):
+            orientation = self._choose_orientation(rng)
+            zig_width = max(1.0, base_bar_width + rng.uniform(-bar_width_variance, bar_width_variance))
+            line_width = max(1.0, base_line_width + rng.uniform(-line_width_variance, line_width_variance))
+            color = self._vary_color(base_color, color_variance, rng)
+            points = (
+                self._build_horizontal_path(rng, zig_width)
+                if orientation == "horizontal"
+                else self._build_vertical_path(rng, zig_width)
+            )
+            self.lines.append({"points": points, "color": color, "width": line_width})
+
+    def _parse_color(self, value: Any) -> tuple[int, int, int]:
+        if isinstance(value, str):
+            parts = value.replace(";", ",").split(",")
+            if len(parts) == 3:
+                try:
+                    return tuple(max(0, min(255, int(float(part.strip())))) for part in parts)  # type: ignore[return-value]
+                except Exception:
+                    pass
+        if isinstance(value, (list, tuple)) and len(value) == 3:
+            try:
+                return tuple(max(0, min(255, int(v))) for v in value)  # type: ignore[return-value]
+            except Exception:
+                pass
+        return 100, 200, 100
+
+    def _vary_color(self, base: tuple[int, int, int], variance: float, rng: random.Random) -> tuple[int, int, int]:
+        return tuple(
+            max(0, min(255, int(channel + rng.uniform(-variance, variance)))) for channel in base
+        )
+
+    def _choose_orientation(self, rng: random.Random) -> str:
+        if len(self.alignment_options) == 1:
+            return next(iter(self.alignment_options))
+        return "horizontal" if rng.random() < 0.5 else "vertical"
+
+    def _build_horizontal_path(self, rng: random.Random, zig_width: float) -> list[tuple[float, float]]:
+        y_base = rng.uniform(0, self.height)
+        step = max(4.0, zig_width)
+        x = 0.0
+        points: list[tuple[float, float]] = [(0.0, y_base)]
+        direction = 1.0
+        while x < self.width:
+            x += step + rng.uniform(-step * 0.35, step * 0.35)
+            offset = direction * zig_width
+            y = min(max(y_base + offset, 0.0), float(max(self.height - 1, 0)))
+            points.append((min(x, self.width), y))
+            direction *= -1.0
+        points.append((float(self.width), y_base))
+        return points
+
+    def _build_vertical_path(self, rng: random.Random, zig_width: float) -> list[tuple[float, float]]:
+        x_base = rng.uniform(0, self.width)
+        step = max(4.0, zig_width)
+        y = 0.0
+        points: list[tuple[float, float]] = [(x_base, 0.0)]
+        direction = 1.0
+        while y < self.height:
+            y += step + rng.uniform(-step * 0.35, step * 0.35)
+            offset = direction * zig_width
+            x = min(max(x_base + offset, 0.0), float(max(self.width - 1, 0)))
+            points.append((x, min(y, self.height)))
+            direction *= -1.0
+        points.append((x_base, float(self.height)))
+        return points
+
+    def draw(self, image: Image.Image, time_s: float) -> None:  # pragma: no cover - requires human inspection
+        if time_s < self.start_time or time_s > self.end_time:
+            return
+        decay = 1.0
+        if self.fade_time > 0:
+            decay = max(0.0, 1.0 - (time_s - self.event_time) / self.fade_time)
+        alpha = int(255 * decay)
+        if alpha <= 0:
+            return
+        draw = ImageDraw.Draw(image, "RGBA")
+        for line in self.lines:
+            color = tuple(line["color"]) + (alpha,)
+            draw.line(line["points"], fill=color, width=int(line["width"]))
+
+
 @dataclass
 class AssociationConfig:
     track_name: str
@@ -449,7 +558,12 @@ class AssociationDialog(simpledialog.Dialog):
 
         ttk.Label(master, text="Mode:").grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.mode_var = tk.StringVar(value=(self.config.mode if self.config else "fireworks"))
-        self.mode_combo = ttk.Combobox(master, values=["fireworks", "sprite_pop"], textvariable=self.mode_var, state="readonly")
+        self.mode_combo = ttk.Combobox(
+            master,
+            values=["fireworks", "sprite_pop", "zigzag"],
+            textvariable=self.mode_var,
+            state="readonly",
+        )
         self.mode_combo.grid(row=1, column=1, sticky="ew", pady=(8, 0))
         self.mode_combo.bind("<<ComboboxSelected>>", lambda _evt: self._show_mode_options())
 
@@ -486,6 +600,23 @@ class AssociationDialog(simpledialog.Dialog):
             if self.config and self.config.mode == "sprite_pop":
                 value = self.config.options.get(key, default)
             self.sprite_vars[key] = tk.StringVar(value=str(value))
+        zigzag_defaults = {
+            "line_width": 2,
+            "line_width_variance": 0,
+            "bar_width": 25,
+            "bar_width_variance": 0,
+            "color": "100,200,100",
+            "color_variance": 10,
+            "amount": 1,
+            "alignment": "both",
+            "fade": 12,
+        }
+        self.zigzag_vars: dict[str, tk.StringVar] = {}
+        for key, default in zigzag_defaults.items():
+            value = default
+            if self.config and self.config.mode == "zigzag":
+                value = self.config.options.get(key, default)
+            self.zigzag_vars[key] = tk.StringVar(value=str(value))
 
     def _show_mode_options(self) -> None:
         for child in self.options_frame.winfo_children():
@@ -517,7 +648,7 @@ class AssociationDialog(simpledialog.Dialog):
                 state="readonly",
                 width=10,
             ).grid(row=6, column=1, sticky="w")
-        else:
+        elif mode == "sprite_pop":
             ttk.Label(self.options_frame, text="Sprite pop options:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", columnspan=3)
             ttk.Label(self.options_frame, text="Sprite image:").grid(row=1, column=0, sticky="w")
             entry = ttk.Entry(self.options_frame, textvariable=self.sprite_vars["sprite_path"], width=36)
@@ -533,6 +664,32 @@ class AssociationDialog(simpledialog.Dialog):
             ttk.Entry(self.options_frame, textvariable=self.sprite_vars["hang_time"], width=8).grid(row=3, column=1, sticky="w")
             ttk.Label(self.options_frame, text="Pre-zoom (frames):").grid(row=4, column=0, sticky="w")
             ttk.Entry(self.options_frame, textvariable=self.sprite_vars["pre_zoom_frames"], width=8).grid(row=4, column=1, sticky="w")
+        else:
+            ttk.Label(self.options_frame, text="Zigzag options:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", columnspan=2)
+            ttk.Label(self.options_frame, text="Line width:").grid(row=1, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.zigzag_vars["line_width"], width=10).grid(row=1, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Line width variance:").grid(row=2, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.zigzag_vars["line_width_variance"], width=10).grid(row=2, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Bar width:").grid(row=3, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.zigzag_vars["bar_width"], width=10).grid(row=3, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Bar width variance:").grid(row=4, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.zigzag_vars["bar_width_variance"], width=10).grid(row=4, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Color (R,G,B):").grid(row=5, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.zigzag_vars["color"], width=10).grid(row=5, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Color variance:").grid(row=6, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.zigzag_vars["color_variance"], width=10).grid(row=6, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Amount:").grid(row=7, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.zigzag_vars["amount"], width=10).grid(row=7, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Alignment:").grid(row=8, column=0, sticky="w")
+            ttk.Combobox(
+                self.options_frame,
+                values=["horizontal", "vertical", "both"],
+                textvariable=self.zigzag_vars["alignment"],
+                state="readonly",
+                width=10,
+            ).grid(row=8, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Fade (frames):").grid(row=9, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.zigzag_vars["fade"], width=10).grid(row=9, column=1, sticky="w")
 
     def _browse_sprite(self, entry: ttk.Entry) -> None:
         initial = Path(self.sprite_vars["sprite_path"].get()).expanduser()
@@ -557,12 +714,24 @@ class AssociationDialog(simpledialog.Dialog):
                 "color": self.firework_vars["color"].get() or "random",
                 "firework_type": self.firework_vars["firework_type"].get() or "random",
             }
-        else:
+        elif mode == "sprite_pop":
             options = {
                 "sprite_path": self.sprite_vars["sprite_path"].get().strip(),
                 "scale": float(self.sprite_vars["scale"].get() or 1.0),
                 "hang_time": float(self.sprite_vars["hang_time"].get() or 0.35),
                 "pre_zoom_frames": int(self.sprite_vars["pre_zoom_frames"].get() or 5),
+            }
+        else:
+            options = {
+                "line_width": float(self.zigzag_vars["line_width"].get() or 2),
+                "line_width_variance": float(self.zigzag_vars["line_width_variance"].get() or 0),
+                "bar_width": float(self.zigzag_vars["bar_width"].get() or 25),
+                "bar_width_variance": float(self.zigzag_vars["bar_width_variance"].get() or 0),
+                "color": self.zigzag_vars["color"].get() or "100,200,100",
+                "color_variance": float(self.zigzag_vars["color_variance"].get() or 0),
+                "amount": int(self.zigzag_vars["amount"].get() or 1),
+                "alignment": self.zigzag_vars["alignment"].get() or "both",
+                "fade": int(self.zigzag_vars["fade"].get() or 12),
             }
         self.result_config = AssociationConfig(
             track_name=self.track_var.get(),
@@ -1036,11 +1205,19 @@ class TimedActionTool(tk.Tk):
                     f"color {assoc.options.get('color', 'random')}, "
                     f"type {assoc.options.get('firework_type', 'random')}"
                 )
-            else:
+            elif assoc.mode == "sprite_pop":
                 summary = (
                     f"Sprite {Path(assoc.options.get('sprite_path', '')).name or 'generated'}, "
                     f"scale {assoc.options.get('scale', 1.0)}, hang {assoc.options.get('hang_time', 0.35)}s, "
                     f"pre-zoom {assoc.options.get('pre_zoom_frames', 5)}f"
+                )
+            else:
+                summary = (
+                    f"Lines {assoc.options.get('amount', 1)}, "
+                    f"align {assoc.options.get('alignment', 'both')}, "
+                    f"width {assoc.options.get('line_width', 2)}, "
+                    f"bars {assoc.options.get('bar_width', 25)}, "
+                    f"fade {assoc.options.get('fade', 12)}f"
                 )
             self.assoc_tree.insert("", "end", iid=str(idx), values=(assoc.track_name, assoc.mode, summary))
 
@@ -1122,7 +1299,7 @@ class TimedActionTool(tk.Tk):
                             options=assoc.options,
                         )
                     )
-                else:
+                elif assoc.mode == "sprite_pop":
                     sprite_img = self._load_sprite_image(assoc.options.get("sprite_path"))
                     effects.append(
                         SpritePopEffect(
@@ -1131,6 +1308,16 @@ class TimedActionTool(tk.Tk):
                             canvas_size=(render_settings.width, render_settings.height),
                             rng=rng,
                             sprite=sprite_img,
+                            options=assoc.options,
+                        )
+                    )
+                else:
+                    effects.append(
+                        ZigZagEffect(
+                            event=event,
+                            fps=render_settings.fps,
+                            canvas_size=(render_settings.width, render_settings.height),
+                            rng=rng,
                             options=assoc.options,
                         )
                     )

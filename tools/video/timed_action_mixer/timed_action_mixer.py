@@ -10,12 +10,12 @@ import shutil
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageColor, ImageDraw, ImageTk
 
 try:  # Pillow < 10 compatibility
     RESAMPLE = Image.Resampling.LANCZOS
@@ -38,11 +38,21 @@ except Exception:  # pragma: no cover - defer error handling until runtime
     pygame = None
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
 
 DEFAULT_FPS = 30
 FRAME_SIZE = (960, 540)
+DEFAULT_CODEC = "libx264"
+
+
+@dataclass
+class RenderSettings:
+    width: int = FRAME_SIZE[0]
+    height: int = FRAME_SIZE[1]
+    fps: int = DEFAULT_FPS
+    codec: str = DEFAULT_CODEC
+    background: str = "black"
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +390,9 @@ class RenderPlan:
     fps: int
     size: tuple[int, int]
     duration: float
+    codec: str
+    background: tuple[int, int, int, int]
+    use_alpha: bool
     associations: List[AssociationPlan]
 
     @property
@@ -391,9 +404,13 @@ class RenderPlan:
 
     def generate_frame(self, frame_idx: int) -> np.ndarray:  # pragma: no cover - visual output
         time_s = self.frame_time(frame_idx)
-        image = Image.new("RGB", self.size, "black")
+        mode = "RGBA" if self.use_alpha else "RGB"
+        background = self.background if self.use_alpha else self.background[:3]
+        image = Image.new(mode, self.size, background)
         for assoc in self.associations:
             assoc.render(image, time_s)
+        if not self.use_alpha and image.mode == "RGBA":
+            image = image.convert("RGB")
         return np.array(image, dtype=np.uint8)
 
 
@@ -554,6 +571,124 @@ class AssociationDialog(simpledialog.Dialog):
         )
 
 
+class RenderSettingsDialog(simpledialog.Dialog):
+    PRESETS = [
+        ("4K UHD (3840x2160, 16:9)", 3840, 2160),
+        ("QHD (2560x1440, 16:9)", 2560, 1440),
+        ("Full HD (1920x1080, 16:9)", 1920, 1080),
+        ("HD (1280x720, 16:9)", 1280, 720),
+        ("Square HD (1080x1080, 1:1)", 1080, 1080),
+        ("Vertical HD (1080x1920, 9:16)", 1080, 1920),
+        ("Custom", None, None),
+    ]
+
+    CODECS = [
+        ("H.264 (libx264)", "libx264"),
+        ("H.265 (libx265)", "libx265"),
+        ("VP9 (libvpx-vp9)", "libvpx-vp9"),
+        ("QuickTime Animation (qtrle)", "qtrle"),
+    ]
+
+    def __init__(self, parent, settings: RenderSettings):
+        self.settings = settings
+        self.result_settings: Optional[RenderSettings] = None
+        super().__init__(parent, title="Render settings")
+
+    def body(self, master):
+        ttk.Label(master, text="Preset:").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        preset_values = [label for label, _w, _h in self.PRESETS]
+        self.preset_var = tk.StringVar(value=self._matching_preset_label())
+        preset_combo = ttk.Combobox(master, textvariable=self.preset_var, values=preset_values, state="readonly")
+        preset_combo.grid(row=0, column=1, columnspan=2, sticky="ew", pady=(0, 4))
+        preset_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
+
+        ttk.Label(master, text="Width:").grid(row=1, column=0, sticky="w")
+        self.width_var = tk.StringVar(value=str(self.settings.width))
+        width_entry = ttk.Entry(master, textvariable=self.width_var, width=10)
+        width_entry.grid(row=1, column=1, sticky="w")
+
+        ttk.Label(master, text="Height:").grid(row=2, column=0, sticky="w")
+        self.height_var = tk.StringVar(value=str(self.settings.height))
+        height_entry = ttk.Entry(master, textvariable=self.height_var, width=10)
+        height_entry.grid(row=2, column=1, sticky="w")
+
+        ttk.Label(master, text="FPS:").grid(row=3, column=0, sticky="w")
+        self.fps_var = tk.StringVar(value=str(self.settings.fps))
+        fps_entry = ttk.Entry(master, textvariable=self.fps_var, width=10)
+        fps_entry.grid(row=3, column=1, sticky="w")
+
+        ttk.Label(master, text="Codec:").grid(row=4, column=0, sticky="w")
+        codec_values = [label for label, _ in self.CODECS]
+        self.codec_map = {label: key for label, key in self.CODECS}
+        initial_codec_label = next((label for label, key in self.CODECS if key == self.settings.codec), codec_values[0])
+        self.codec_var = tk.StringVar(value=initial_codec_label)
+        codec_combo = ttk.Combobox(master, textvariable=self.codec_var, values=codec_values, state="readonly")
+        codec_combo.grid(row=4, column=1, columnspan=2, sticky="ew")
+
+        self.transparent_var = tk.BooleanVar(value=str(self.settings.background).lower() == "transparent")
+        self.background_var = tk.StringVar(value=str(self.settings.background))
+        ttk.Checkbutton(master, text="Transparent (if supported)", variable=self.transparent_var, command=self._update_background_state).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 2))
+
+        ttk.Label(master, text="Background:").grid(row=6, column=0, sticky="w")
+        self.background_entry = ttk.Entry(master, textvariable=self.background_var, width=14)
+        self.background_entry.grid(row=6, column=1, sticky="w")
+        ttk.Button(master, text="Pick", command=self._pick_color).grid(row=6, column=2, sticky="e")
+
+        master.columnconfigure(1, weight=1)
+        self._update_background_state()
+        return width_entry
+
+    def _matching_preset_label(self) -> str:
+        for label, width, height in self.PRESETS:
+            if width is None or height is None:
+                continue
+            if width == self.settings.width and height == self.settings.height:
+                return label
+        return "Custom"
+
+    def _on_preset_selected(self, _event=None):
+        label = self.preset_var.get()
+        for preset_label, width, height in self.PRESETS:
+            if preset_label == label and width and height:
+                self.width_var.set(str(width))
+                self.height_var.set(str(height))
+                break
+
+    def _pick_color(self) -> None:
+        color = colorchooser.askcolor(title="Choose background", initialcolor=self.background_var.get())
+        if color and color[1]:
+            self.background_var.set(color[1])
+
+    def _update_background_state(self) -> None:
+        state = "disabled" if self.transparent_var.get() else "normal"
+        self.background_entry.configure(state=state)
+
+    def validate(self) -> bool:
+        try:
+            width = int(self.width_var.get())
+            height = int(self.height_var.get())
+            fps = int(self.fps_var.get())
+        except ValueError:
+            messagebox.showerror("Render settings", "Width, height, and FPS must be numbers.", parent=self)
+            return False
+        if width <= 0 or height <= 0 or fps <= 0:
+            messagebox.showerror("Render settings", "Width, height, and FPS must be positive.", parent=self)
+            return False
+        return True
+
+    def apply(self) -> None:
+        label = self.codec_var.get()
+        codec = self.codec_map.get(label, DEFAULT_CODEC)
+        background = "transparent" if self.transparent_var.get() else (self.background_var.get() or "black")
+        self.result_settings = RenderSettings(
+            width=int(self.width_var.get()),
+            height=int(self.height_var.get()),
+            fps=int(self.fps_var.get()),
+            codec=codec,
+            background=background,
+        )
+
+
 class TimedActionTool(tk.Tk):
     def __init__(self, args: argparse.Namespace):
         super().__init__()
@@ -565,6 +700,7 @@ class TimedActionTool(tk.Tk):
         self.project_name = args.project_name or (self.project_root.name if self.project_root else "Standalone")
         self.output_dir = Path(args.output_dir).resolve() if args.output_dir else self._default_output_dir()
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.render_settings_path = self.output_dir / "render_settings.json"
         self.assets_dir = (self.project_root / "assets") if self.project_root else (self.repo_root / "assets")
         self.assets_dir.mkdir(parents=True, exist_ok=True)
         if self.project_root:
@@ -572,7 +708,8 @@ class TimedActionTool(tk.Tk):
         else:
             self.timing_dir = self.repo_root / "assets" / "timing"
         self.timing_dir.mkdir(parents=True, exist_ok=True)
-        self.temp_render_path = self.output_dir / "timed_action_preview.mp4"
+        self.render_settings: RenderSettings = self._load_render_settings()
+        self.temp_render_path = self._render_output_path(self.render_settings.codec)
 
         self.audio_path = tk.StringVar()
         self.timing_path = tk.StringVar()
@@ -587,10 +724,93 @@ class TimedActionTool(tk.Tk):
         self._build_ui()
 
     # ------------------------------------------------------------------
+    def configure_render(self) -> None:
+        dialog = RenderSettingsDialog(self, self.render_settings)
+        if dialog.result_settings:
+            self.render_settings = dialog.result_settings
+            self.temp_render_path = self._render_output_path(self.render_settings.codec)
+            self._save_render_settings()
+            self.status_var.set(
+                f"Render settings updated: {self.render_settings.width}x{self.render_settings.height} @ {self.render_settings.fps}fps"
+            )
+
+    # ------------------------------------------------------------------
     def _default_output_dir(self) -> Path:
         if self.project_root:
             return self.project_root / "internal" / "video" / "timed_action_mixer"
         return self.repo_root / "assets" / "timed_action_mixer"
+
+    # ------------------------------------------------------------------
+    def _render_suffix(self, codec: str) -> str:
+        lookup = {
+            "libx264": "mp4",
+            "libx265": "mp4",
+            "libvpx-vp9": "webm",
+            "qtrle": "mov",
+        }
+        return lookup.get(codec.lower(), "mp4")
+
+    # ------------------------------------------------------------------
+    def _render_output_path(self, codec: str) -> Path:
+        return self.output_dir / f"timed_action_preview.{self._render_suffix(codec)}"
+
+    # ------------------------------------------------------------------
+    def _load_render_settings(self) -> RenderSettings:
+        if self.render_settings_path.exists():
+            try:
+                payload = json.loads(self.render_settings_path.read_text(encoding="utf-8"))
+                return self._parse_render_settings(payload)
+            except Exception:
+                pass
+        return RenderSettings()
+
+    # ------------------------------------------------------------------
+    def _parse_render_settings(self, payload: Dict[str, Any]) -> RenderSettings:
+        width = int(payload.get("width", FRAME_SIZE[0]) or FRAME_SIZE[0])
+        height = int(payload.get("height", FRAME_SIZE[1]) or FRAME_SIZE[1])
+        fps = int(payload.get("fps", DEFAULT_FPS) or DEFAULT_FPS)
+        codec = str(payload.get("codec", DEFAULT_CODEC) or DEFAULT_CODEC)
+        background = str(payload.get("background", "black") or "black")
+        return RenderSettings(width=width, height=height, fps=fps, codec=codec, background=background)
+
+    # ------------------------------------------------------------------
+    def _save_render_settings(self) -> None:
+        payload = asdict(self.render_settings)
+        try:
+            self.render_settings_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    def _validated_render_settings(self) -> RenderSettings:
+        settings = self.render_settings
+        width = max(1, int(settings.width or FRAME_SIZE[0]))
+        height = max(1, int(settings.height or FRAME_SIZE[1]))
+        fps = max(1, int(settings.fps or DEFAULT_FPS))
+        codec = settings.codec or DEFAULT_CODEC
+        background = settings.background or "black"
+        self.render_settings = RenderSettings(width=width, height=height, fps=fps, codec=codec, background=background)
+        self._save_render_settings()
+        return self.render_settings
+
+    # ------------------------------------------------------------------
+    def _supports_alpha(self, codec: str) -> bool:
+        return codec.lower() in {"qtrle"}
+
+    # ------------------------------------------------------------------
+    def _resolve_background(self, settings: RenderSettings) -> tuple[tuple[int, int, int, int], bool]:
+        choice = str(settings.background or "black")
+        codec = settings.codec or DEFAULT_CODEC
+        if choice.lower() == "transparent":
+            if self._supports_alpha(codec):
+                return (0, 0, 0, 0), True
+            self.status_var.set("Selected codec does not support transparency; using opaque background.")
+            choice = "black"
+        try:
+            rgb = ImageColor.getrgb(choice)
+        except Exception:
+            rgb = ImageColor.getrgb("black")
+        return (rgb[0], rgb[1], rgb[2], 255), False
 
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
@@ -665,6 +885,7 @@ class TimedActionTool(tk.Tk):
 
         action_frame = ttk.Frame(container)
         action_frame.pack(fill="x", pady=(12, 0))
+        ttk.Button(action_frame, text="Render settings", command=self.configure_render).pack(side="left", padx=(0, 8))
         ttk.Button(action_frame, text="Render animation", command=self.render_video).pack(side="left")
         ttk.Button(action_frame, text="Play last render", command=self.play_render).pack(side="left", padx=(8, 0))
         ttk.Button(action_frame, text="Save to assets", command=self.save_render).pack(side="left", padx=(8, 0))
@@ -883,6 +1104,8 @@ class TimedActionTool(tk.Tk):
         rng = random.Random(1234)
         associations: List[AssociationPlan] = []
         max_end_time = duration
+        render_settings = self._validated_render_settings()
+        self.temp_render_path = self._render_output_path(render_settings.codec)
         for assoc in self.associations:
             track = self.timing_doc.tracks.get(assoc.track_name)
             if not track:
@@ -893,8 +1116,8 @@ class TimedActionTool(tk.Tk):
                     effects.append(
                         FireworkEffect(
                             event=event,
-                            fps=DEFAULT_FPS,
-                            canvas_size=FRAME_SIZE,
+                            fps=render_settings.fps,
+                            canvas_size=(render_settings.width, render_settings.height),
                             rng=rng,
                             options=assoc.options,
                         )
@@ -904,8 +1127,8 @@ class TimedActionTool(tk.Tk):
                     effects.append(
                         SpritePopEffect(
                             event=event,
-                            fps=DEFAULT_FPS,
-                            canvas_size=FRAME_SIZE,
+                            fps=render_settings.fps,
+                            canvas_size=(render_settings.width, render_settings.height),
                             rng=rng,
                             sprite=sprite_img,
                             options=assoc.options,
@@ -915,11 +1138,15 @@ class TimedActionTool(tk.Tk):
                     max_end_time = max(max_end_time, effects[-1].end_time)
             associations.append(AssociationPlan(config=assoc, effects=effects))
         duration = max(duration, max_end_time)
+        background, use_alpha = self._resolve_background(render_settings)
         return RenderPlan(
             audio_path=audio_path,
-            fps=DEFAULT_FPS,
-            size=FRAME_SIZE,
+            fps=render_settings.fps,
+            size=(render_settings.width, render_settings.height),
             duration=duration,
+            codec=render_settings.codec,
+            background=background,
+            use_alpha=use_alpha,
             associations=associations,
         )
 
@@ -965,19 +1192,20 @@ class TimedActionTool(tk.Tk):
     # ------------------------------------------------------------------
     def _render_worker(self, plan: RenderPlan) -> None:
         start = time.perf_counter()
+        writer_kwargs: Dict[str, Any] = {
+            "fps": plan.fps,
+            "codec": plan.codec,
+            "format": "FFMPEG",
+            "macro_block_size": 1,
+            "audio_path": str(plan.audio_path),
+            "audio_codec": "aac",
+        }
+        if plan.codec.startswith("libx264"):
+            writer_kwargs["quality"] = 8
+        if plan.use_alpha:
+            writer_kwargs["ffmpeg_params"] = ["-pix_fmt", "rgba"]
         try:
-            writer = imageio.get_writer(
-                self.temp_render_path,
-                fps=plan.fps,
-                codec="libx264",
-                quality=8,
-                format="FFMPEG",
-                # Avoid macro block warnings/resizing when the frame size is not a
-                # multiple of 16px (common when using extreme scale multipliers).
-                macro_block_size=1,
-                audio_path=str(plan.audio_path),
-                audio_codec="aac",
-            )
+            writer = imageio.get_writer(self.temp_render_path, **writer_kwargs)
         except Exception as exc:
             self._set_status_async(f"Unable to start writer: {exc}")
             return
@@ -1070,7 +1298,7 @@ class TimedActionTool(tk.Tk):
         if not name:
             return
         safe_name = "".join(ch for ch in name if ch.isalnum() or ch in ("-", "_")) or "render"
-        target = self.assets_dir / f"{safe_name}.mp4"
+        target = self.assets_dir / f"{safe_name}{self.temp_render_path.suffix}"
         try:
             shutil.copy2(self.temp_render_path, target)
         except Exception as exc:
@@ -1128,6 +1356,7 @@ class TimedActionTool(tk.Tk):
                 }
                 for assoc in self.associations
             ],
+            "render_settings": asdict(self.render_settings),
         }
 
     # ------------------------------------------------------------------
@@ -1150,6 +1379,11 @@ class TimedActionTool(tk.Tk):
                 self.associations.append(
                     AssociationConfig(track_name=str(track_name), mode=str(mode), options=dict(options))
                 )
+        render_settings_payload = payload.get("render_settings")
+        if isinstance(render_settings_payload, dict):
+            self.render_settings = self._parse_render_settings(render_settings_payload)
+            self.temp_render_path = self._render_output_path(self.render_settings.codec)
+            self._save_render_settings()
         self._refresh_assoc_tree()
         if timing_path:
             self._load_timing()

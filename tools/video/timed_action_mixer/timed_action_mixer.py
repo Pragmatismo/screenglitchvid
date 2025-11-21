@@ -11,6 +11,7 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
+from bisect import bisect_right
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -106,6 +107,60 @@ class TimingDocument:
         for name, track_payload in tracks_payload.items():
             tracks[name] = TimingTrack.from_dict(name, track_payload)
         return cls(duration=duration, tracks=tracks)
+
+
+@dataclass
+class FrequencyFrame:
+    time: float
+    levels: List[float]
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "FrequencyFrame":
+        time = float(payload.get("time", 0.0))
+        levels = [float(value) for value in payload.get("levels", [])]
+        return cls(time=time, levels=levels)
+
+
+@dataclass
+class FrequencyDocument:
+    duration: float
+    sample_rate: Optional[int]
+    bin_edges: List[tuple[float, float]]
+    capture_rate: float
+    frames: List[FrequencyFrame]
+
+    @classmethod
+    def from_json(cls, path: Path) -> "FrequencyDocument":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        duration = float(payload.get("duration", 0.0))
+        sample_rate = payload.get("sample_rate")
+        edges_payload = payload.get("bin_edges", [])
+        bin_edges: List[tuple[float, float]] = [
+            (float(edge[0]), float(edge[1]))
+            for edge in edges_payload
+            if isinstance(edge, (list, tuple)) and len(edge) >= 2
+        ]
+        capture_rate = float(payload.get("capture_rate", 0.0))
+        frames_payload = payload.get("frames", [])
+        frames = [FrequencyFrame.from_dict(entry) for entry in frames_payload]
+        return cls(
+            duration=duration,
+            sample_rate=sample_rate,
+            bin_edges=bin_edges,
+            capture_rate=capture_rate,
+            frames=frames,
+        )
+
+    def level_at(self, timestamp: float, bin_index: int) -> float:
+        if not self.frames:
+            return 0.0
+        times = [frame.time for frame in self.frames]
+        idx = bisect_right(times, timestamp) - 1
+        idx = max(0, min(idx, len(self.frames) - 1))
+        frame = self.frames[idx]
+        if bin_index < 0 or bin_index >= len(frame.levels):
+            return 0.0
+        return float(frame.levels[bin_index])
 
 
 # ---------------------------------------------------------------------------
@@ -475,11 +530,61 @@ class ZigZagEffect(VisualEffect):
             draw.line(line["points"], fill=color, width=int(line["width"]))
 
 
+class FrequencyEQEffect(VisualEffect):
+    def __init__(
+        self,
+        freq_doc: FrequencyDocument,
+        bin_index: int,
+        duration: float,
+        canvas_size: tuple[int, int],
+        options: Dict[str, Any],
+    ) -> None:
+        super().__init__(0.0, duration)
+        self.freq_doc = freq_doc
+        self.bin_index = max(0, bin_index)
+        self.width, self.height = canvas_size
+        self.opacity = max(0.0, min(1.0, float(options.get("opacity", 1.0))))
+        self.gap = max(1, int(options.get("gap", 3)))
+        self.bar_width = max(2, int(options.get("bar_width", self.gap * 2)))
+        self.color = self._parse_color(options.get("color", "0,255,0"))
+
+    def _parse_color(self, value: Any) -> tuple[int, int, int, int]:
+        try:
+            if isinstance(value, (list, tuple)) and len(value) >= 3:
+                r, g, b = value[:3]
+            else:
+                parts = str(value).split(",")
+                r, g, b = (int(float(parts[i])) for i in range(3))
+            r = max(0, min(255, int(r)))
+            g = max(0, min(255, int(g)))
+            b = max(0, min(255, int(b)))
+        except Exception:
+            r, g, b = 0, 255, 0
+        alpha = int(255 * self.opacity)
+        return (r, g, b, alpha)
+
+    def draw(self, image: Image.Image, time_s: float) -> None:  # pragma: no cover - visual output
+        level = self.freq_doc.level_at(time_s, self.bin_index)
+        intensity = max(0.0, min(1.0, level / 100.0))
+        bar_height = int(self.height * intensity)
+        if bar_height <= 0:
+            return
+        draw = ImageDraw.Draw(image, "RGBA")
+        bar_count = max(1, self.width // (self.bar_width + self.gap))
+        for idx in range(bar_count):
+            x0 = idx * (self.bar_width + self.gap)
+            x1 = min(self.width, x0 + self.bar_width)
+            y0 = max(0, self.height - bar_height)
+            draw.rectangle((x0, y0, x1, self.height), fill=self.color)
+
+
 @dataclass
 class AssociationConfig:
     track_name: str
     mode: str
     options: Dict[str, Any]
+    source: str = "timing"
+    bin_index: Optional[int] = None
 
 
 @dataclass
@@ -740,6 +845,101 @@ class AssociationDialog(simpledialog.Dialog):
         )
 
 
+class FrequencyAssociationDialog(simpledialog.Dialog):
+    def __init__(
+        self,
+        parent,
+        freq_doc: FrequencyDocument,
+        config: Optional[AssociationConfig] = None,
+    ):
+        self.freq_doc = freq_doc
+        self.config = config
+        self.result_config: Optional[AssociationConfig] = None
+        super().__init__(parent, title="Configure frequency effect")
+
+    def _bin_labels(self) -> list[str]:
+        labels: list[str] = []
+        for idx, edge in enumerate(self.freq_doc.bin_edges):
+            start, end = edge
+            labels.append(f"Bin {idx + 1} ({start:.0f}-{end:.0f} Hz)")
+        if not labels:
+            labels.append("Bin 1")
+        return labels
+
+    def _pick_color(self) -> None:
+        rgb, _ = colorchooser.askcolor(title="Choose EQ color")
+        if rgb:
+            r, g, b = map(int, rgb)
+            self.color_var.set(f"{r},{g},{b}")
+
+    def body(self, master):
+        bin_labels = self._bin_labels()
+        default_bin = 0
+        if self.config and self.config.bin_index is not None:
+            default_bin = self.config.bin_index
+        default_bin = min(max(default_bin, 0), len(bin_labels) - 1)
+        ttk.Label(master, text="Frequency bin:").grid(row=0, column=0, sticky="w")
+        self.bin_var = tk.IntVar(value=default_bin)
+        self.bin_combo = ttk.Combobox(
+            master,
+            values=bin_labels,
+            textvariable=tk.StringVar(value=bin_labels[default_bin]),
+            state="readonly",
+        )
+        self.bin_combo.grid(row=0, column=1, sticky="ew")
+        self.bin_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _evt: self.bin_var.set(self.bin_combo.current()),
+        )
+        master.columnconfigure(1, weight=1)
+
+        ttk.Label(master, text="Mode:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        default_mode = (self.config.mode.upper() if self.config else "EQ")
+        self.mode_var = tk.StringVar(value=default_mode)
+        ttk.Combobox(master, values=["EQ"], textvariable=self.mode_var, state="readonly").grid(
+            row=1, column=1, sticky="ew", pady=(8, 0)
+        )
+
+        options = self.config.options if self.config else {}
+        ttk.Label(master, text="Opacity (0-1):").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        self.opacity_var = tk.StringVar(value=str(options.get("opacity", 1.0)))
+        ttk.Entry(master, textvariable=self.opacity_var, width=12).grid(row=2, column=1, sticky="w", pady=(10, 0))
+
+        ttk.Label(master, text="Gap (px):").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        self.gap_var = tk.StringVar(value=str(options.get("gap", 3)))
+        ttk.Entry(master, textvariable=self.gap_var, width=12).grid(row=3, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(master, text="Color (R,G,B):").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        self.color_var = tk.StringVar(value=str(options.get("color", "0,255,0")))
+        color_row = ttk.Frame(master)
+        color_row.grid(row=4, column=1, sticky="w", pady=(6, 0))
+        ttk.Entry(color_row, textvariable=self.color_var, width=14).pack(side="left")
+        ttk.Button(color_row, text="Pick", command=self._pick_color).pack(side="left", padx=(6, 0))
+
+    def validate(self) -> bool:
+        if not self.freq_doc or not self.freq_doc.bin_edges:
+            messagebox.showerror("Frequency data", "No frequency bins available.")
+            return False
+        return True
+
+    def apply(self) -> None:
+        bin_index = max(0, self.bin_var.get())
+        options = {
+            "opacity": float(self.opacity_var.get() or 1.0),
+            "gap": int(self.gap_var.get() or 3),
+            "color": self.color_var.get() or "0,255,0",
+            "bin_index": bin_index,
+        }
+        label = self._bin_labels()[bin_index if bin_index < len(self._bin_labels()) else 0]
+        self.result_config = AssociationConfig(
+            track_name=label,
+            mode=self.mode_var.get().lower(),
+            options=options,
+            source="frequency",
+            bin_index=bin_index,
+        )
+
+
 class RenderSettingsDialog(simpledialog.Dialog):
     PRESETS = [
         ("4K UHD (3840x2160, 16:9)", 3840, 2160),
@@ -885,6 +1085,8 @@ class TimedActionTool(tk.Tk):
         self.status_var = tk.StringVar(value="Select audio and timing files to begin.")
 
         self.timing_doc: Optional[TimingDocument] = None
+        self.frequency_doc: Optional[FrequencyDocument] = None
+        self.frequency_path: Optional[Path] = None
         self.associations: List[AssociationConfig] = []
         self.last_plan: Optional[RenderPlan] = None
         self.render_thread: Optional[threading.Thread] = None
@@ -1046,7 +1248,8 @@ class TimedActionTool(tk.Tk):
 
         buttons = ttk.Frame(assoc_frame)
         buttons.pack(fill="x")
-        ttk.Button(buttons, text="Add", command=self.add_association).pack(side="left")
+        ttk.Button(buttons, text="Add Trigger", command=self.add_association).pack(side="left")
+        ttk.Button(buttons, text="Add Frequency", command=self.add_frequency_association).pack(side="left", padx=(6, 0))
         ttk.Button(buttons, text="Edit", command=self.edit_association).pack(side="left", padx=(6, 0))
         ttk.Button(buttons, text="Duplicate", command=self.duplicate_association).pack(side="left", padx=(6, 0))
         ttk.Button(buttons, text="Remove", command=self.remove_association).pack(side="left", padx=(6, 0))
@@ -1147,6 +1350,23 @@ class TimedActionTool(tk.Tk):
         return None
 
     # ------------------------------------------------------------------
+    def _find_matching_frequency(self, timing_path: Path) -> Optional[Path]:
+        base = timing_path.stem
+        audio_stem = base[:-7] if base.endswith(".timing") else base
+        candidates = [
+            timing_path.with_name(f"{audio_stem}.frequency.json"),
+            timing_path.with_name(f"{base}.frequency.json"),
+            timing_path.with_suffix(".frequency.json"),
+        ]
+        if self.audio_path.get():
+            audio_base = Path(self.audio_path.get()).expanduser()
+            candidates.insert(0, audio_base.with_suffix(".frequency.json"))
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
+    # ------------------------------------------------------------------
     def _load_timing(self) -> None:
         path = Path(self.timing_path.get()).expanduser()
         if not path.exists():
@@ -1167,7 +1387,24 @@ class TimedActionTool(tk.Tk):
                 iid=track.name,
                 values=(track.name, len(track.events), desc),
             )
+        self._load_frequency(path)
         self.status_var.set(f"Loaded {len(self.timing_doc.tracks)} tracks from timing file.")
+
+    # ------------------------------------------------------------------
+    def _load_frequency(self, timing_path: Path) -> None:
+        frequency_path = self._find_matching_frequency(timing_path)
+        self.frequency_doc = None
+        self.frequency_path = None
+        if not frequency_path:
+            return
+        try:
+            self.frequency_doc = FrequencyDocument.from_json(frequency_path)
+            self.frequency_path = frequency_path
+        except Exception:
+            messagebox.showwarning(
+                "Frequency data",
+                "Could not read the matching frequency file. Regenerate it with the audio map tool.",
+            )
 
     # ------------------------------------------------------------------
     def _on_track_double_click(self, event) -> None:
@@ -1192,11 +1429,30 @@ class TimedActionTool(tk.Tk):
             self._refresh_assoc_tree()
 
     # ------------------------------------------------------------------
+    def add_frequency_association(self) -> None:
+        if not self.frequency_doc:
+            messagebox.showwarning(
+                "Frequency data",
+                "Load a timing file that has matching frequency data from the basic audio map tool.",
+            )
+            return
+        dialog = FrequencyAssociationDialog(self, self.frequency_doc)
+        if dialog.result_config:
+            self.associations.append(dialog.result_config)
+            self._refresh_assoc_tree()
+
+    # ------------------------------------------------------------------
     def _refresh_assoc_tree(self) -> None:
         for item in self.assoc_tree.get_children():
             self.assoc_tree.delete(item)
         for idx, assoc in enumerate(self.associations):
-            if assoc.mode == "fireworks":
+            if assoc.source == "frequency":
+                gap = assoc.options.get("gap", 3)
+                opacity = assoc.options.get("opacity", 1.0)
+                color = assoc.options.get("color", "0,255,0")
+                label = assoc.track_name or self._frequency_bin_label(assoc.bin_index or 0)
+                summary = f"{label}, opacity {opacity}, gap {gap}, color {color}"
+            elif assoc.mode == "fireworks":
                 summary = (
                     f"Lead {assoc.options.get('pre_launch_frames', 12)}f, "
                     f"fade {assoc.options.get('fade', 0.6)}s, "
@@ -1222,17 +1478,34 @@ class TimedActionTool(tk.Tk):
             self.assoc_tree.insert("", "end", iid=str(idx), values=(assoc.track_name, assoc.mode, summary))
 
     # ------------------------------------------------------------------
+    def _frequency_bin_label(self, bin_index: int) -> str:
+        if not self.frequency_doc or not self.frequency_doc.bin_edges:
+            return f"Bin {bin_index + 1}"
+        clamped = max(0, min(bin_index, len(self.frequency_doc.bin_edges) - 1))
+        start, end = self.frequency_doc.bin_edges[clamped]
+        return f"Bin {clamped + 1} ({start:.0f}-{end:.0f} Hz)"
+
+    # ------------------------------------------------------------------
     def edit_association(self) -> None:
         selection = self.assoc_tree.selection()
         if not selection:
             return
         idx = int(selection[0])
         assoc = self.associations[idx]
-        dialog = AssociationDialog(
-            self,
-            self.timing_doc.tracks.keys() if self.timing_doc else [],
-            assoc,
-        )
+        if assoc.source == "frequency":
+            if not self.frequency_doc:
+                messagebox.showwarning(
+                    "Frequency data",
+                    "Load a timing file with matching frequency data to edit this association.",
+                )
+                return
+            dialog = FrequencyAssociationDialog(self, self.frequency_doc, assoc)
+        else:
+            dialog = AssociationDialog(
+                self,
+                self.timing_doc.tracks.keys() if self.timing_doc else [],
+                assoc,
+            )
         if dialog.result_config:
             self.associations[idx] = dialog.result_config
             self._refresh_assoc_tree()
@@ -1248,6 +1521,8 @@ class TimedActionTool(tk.Tk):
             track_name=assoc.track_name,
             mode=assoc.mode,
             options=dict(assoc.options),
+            source=assoc.source,
+            bin_index=assoc.bin_index,
         )
         self.associations.insert(idx + 1, duplicate)
         self._refresh_assoc_tree()
@@ -1272,6 +1547,8 @@ class TimedActionTool(tk.Tk):
         if self.timing_doc is None:
             raise RuntimeError("Load a timing file before rendering.")
         duration = self.timing_doc.duration
+        if self.frequency_doc:
+            duration = max(duration, self.frequency_doc.duration)
         if sf:
             try:
                 info = sf.info(str(audio_path))
@@ -1284,6 +1561,22 @@ class TimedActionTool(tk.Tk):
         render_settings = self._validated_render_settings()
         self.temp_render_path = self._render_output_path(render_settings.codec)
         for assoc in self.associations:
+            if assoc.source == "frequency":
+                if not self.frequency_doc:
+                    raise RuntimeError("Load matching frequency data before rendering frequency effects.")
+                bin_index = assoc.bin_index
+                if bin_index is None:
+                    bin_index = int(assoc.options.get("bin_index", 0))
+                effect = FrequencyEQEffect(
+                    freq_doc=self.frequency_doc,
+                    bin_index=bin_index,
+                    duration=duration,
+                    canvas_size=(render_settings.width, render_settings.height),
+                    options=assoc.options,
+                )
+                associations.append(AssociationPlan(config=assoc, effects=[effect]))
+                continue
+
             track = self.timing_doc.tracks.get(assoc.track_name)
             if not track:
                 continue
@@ -1535,11 +1828,14 @@ class TimedActionTool(tk.Tk):
         return {
             "audio_path": self.audio_path.get(),
             "timing_path": self.timing_path.get(),
+            "frequency_path": str(self.frequency_path) if self.frequency_path else "",
             "associations": [
                 {
                     "track_name": assoc.track_name,
                     "mode": assoc.mode,
                     "options": dict(assoc.options),
+                    "source": assoc.source,
+                    "bin_index": assoc.bin_index,
                 }
                 for assoc in self.associations
             ],
@@ -1550,8 +1846,11 @@ class TimedActionTool(tk.Tk):
     def _apply_settings(self, payload: Dict[str, Any]) -> None:
         audio_path = str(payload.get("audio_path", ""))
         timing_path = str(payload.get("timing_path", ""))
+        frequency_path_value = str(payload.get("frequency_path", ""))
         self.audio_path.set(audio_path)
         self.timing_path.set(timing_path)
+        self.frequency_doc = None
+        self.frequency_path = None
         self.associations = []
         assoc_payloads = payload.get("associations", [])
         if isinstance(assoc_payloads, list):
@@ -1561,16 +1860,36 @@ class TimedActionTool(tk.Tk):
                 track_name = entry.get("track_name")
                 mode = entry.get("mode")
                 options = entry.get("options", {})
+                source = str(entry.get("source", "timing"))
+                bin_index = entry.get("bin_index")
                 if not track_name or not mode or not isinstance(options, dict):
                     continue
+                try:
+                    parsed_bin_index = int(bin_index) if bin_index is not None else None
+                except Exception:
+                    parsed_bin_index = None
                 self.associations.append(
-                    AssociationConfig(track_name=str(track_name), mode=str(mode), options=dict(options))
+                    AssociationConfig(
+                        track_name=str(track_name),
+                        mode=str(mode),
+                        options=dict(options),
+                        source=source,
+                        bin_index=parsed_bin_index,
+                    )
                 )
         render_settings_payload = payload.get("render_settings")
         if isinstance(render_settings_payload, dict):
             self.render_settings = self._parse_render_settings(render_settings_payload)
             self.temp_render_path = self._render_output_path(self.render_settings.codec)
             self._save_render_settings()
+        if frequency_path_value:
+            candidate = Path(frequency_path_value).expanduser()
+            if candidate.exists():
+                try:
+                    self.frequency_doc = FrequencyDocument.from_json(candidate)
+                    self.frequency_path = candidate
+                except Exception:
+                    messagebox.showwarning("Frequency data", "Unable to load saved frequency file.")
         self._refresh_assoc_tree()
         if timing_path:
             self._load_timing()

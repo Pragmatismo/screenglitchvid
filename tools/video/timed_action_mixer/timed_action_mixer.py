@@ -9,7 +9,7 @@ import random
 import shutil
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import asdict, dataclass, field
 from bisect import bisect_right
 from pathlib import Path
@@ -534,19 +534,36 @@ class FrequencyEQEffect(VisualEffect):
     def __init__(
         self,
         freq_doc: FrequencyDocument,
-        bin_index: int,
+        bin_indices: list[int],
         duration: float,
         canvas_size: tuple[int, int],
+        fps: int,
         options: Dict[str, Any],
     ) -> None:
         super().__init__(0.0, duration)
         self.freq_doc = freq_doc
-        self.bin_index = max(0, bin_index)
+        self.bin_indices = [max(0, int(idx)) for idx in bin_indices] or [0]
         self.width, self.height = canvas_size
+        self.fps = max(1, int(fps))
         self.opacity = max(0.0, min(1.0, float(options.get("opacity", 1.0))))
         self.gap = max(1, int(options.get("gap", 3)))
         self.bar_width = max(2, int(options.get("bar_width", self.gap * 2)))
+        self.fade_frames = max(0, int(options.get("fade_frames", 8)))
+        self.jump_threshold = max(0.0, float(options.get("jump_threshold_percent", options.get("jump_percent", 0.0))))
+        self.jump_window_frames = max(0, int(round(float(options.get("jump_window_seconds", options.get("jump_time", 0.0))) * self.fps)))
+        self.jump_sustain_frames = max(0, int(options.get("jump_sustain_frames", options.get("jump_sustain", 0))))
         self.color = self._parse_color(options.get("color", "0,255,0"))
+        self.jump_color = self._parse_color(options.get("jump_color", "255,80,80"))
+        history_size = max(2, self.jump_window_frames + 2)
+        self.bar_states: dict[int, dict[str, Any]] = {
+            idx: {
+                "last_active_frame": None,
+                "last_height": 0,
+                "history": deque(maxlen=history_size),
+                "jump_until": -1,
+            }
+            for idx in self.bin_indices
+        }
 
     def _parse_color(self, value: Any) -> tuple[int, int, int, int]:
         try:
@@ -564,18 +581,60 @@ class FrequencyEQEffect(VisualEffect):
         return (r, g, b, alpha)
 
     def draw(self, image: Image.Image, time_s: float) -> None:  # pragma: no cover - visual output
-        level = self.freq_doc.level_at(time_s, self.bin_index)
-        intensity = max(0.0, min(1.0, level / 100.0))
-        bar_height = int(self.height * intensity)
-        if bar_height <= 0:
-            return
+        frame_idx = int(round(time_s * self.fps))
         draw = ImageDraw.Draw(image, "RGBA")
-        bar_count = max(1, self.width // (self.bar_width + self.gap))
-        for idx in range(bar_count):
-            x0 = idx * (self.bar_width + self.gap)
+        for position, bin_index in enumerate(self.bin_indices):
+            level = self.freq_doc.level_at(time_s, bin_index)
+            intensity = max(0.0, min(1.0, level / 100.0))
+            bar_height = int(self.height * intensity)
+            state = self.bar_states.setdefault(
+                bin_index,
+                {
+                    "last_active_frame": None,
+                    "last_height": 0,
+                    "history": deque(maxlen=max(2, self.jump_window_frames + 2)),
+                    "jump_until": -1,
+                },
+            )
+            history: deque[tuple[int, float]] = state["history"]
+            history.append((frame_idx, level))
+            if self.jump_window_frames:
+                while history and frame_idx - history[0][0] > self.jump_window_frames:
+                    history.popleft()
+                if (
+                    self.jump_threshold > 0
+                    and history
+                    and level > history[0][1] * (1.0 + self.jump_threshold / 100.0)
+                ):
+                    state["jump_until"] = frame_idx + self.jump_sustain_frames
+
+            active = bar_height > 0
+            alpha: Optional[int] = None
+            display_height = bar_height
+            if active:
+                state["last_active_frame"] = frame_idx
+                state["last_height"] = bar_height
+                alpha = self.color[3]
+            else:
+                last_frame = state.get("last_active_frame")
+                display_height = state.get("last_height", 0)
+                if last_frame is not None and self.fade_frames > 0 and display_height > 0:
+                    elapsed = frame_idx - last_frame
+                    if elapsed == 1:
+                        alpha = int(self.color[3] * 0.5)
+                    elif 1 < elapsed <= self.fade_frames:
+                        remaining = max(self.fade_frames - 1, 1)
+                        decay = max(0.0, 0.5 * (1 - (elapsed - 1) / remaining))
+                        alpha = int(self.color[3] * decay)
+            if alpha is None or display_height <= 0:
+                continue
+
+            color = self.jump_color if frame_idx <= state.get("jump_until", -1) else self.color
+            color = color[:3] + (alpha,)
+            x0 = position * (self.bar_width + self.gap)
             x1 = min(self.width, x0 + self.bar_width)
-            y0 = max(0, self.height - bar_height)
-            draw.rectangle((x0, y0, x1, self.height), fill=self.color)
+            y0 = max(0, self.height - display_height)
+            draw.rectangle((x0, y0, x1, self.height), fill=color)
 
 
 @dataclass
@@ -585,6 +644,7 @@ class AssociationConfig:
     options: Dict[str, Any]
     source: str = "timing"
     bin_index: Optional[int] = None
+    bin_indices: Optional[list[int]] = None
 
 
 @dataclass
@@ -866,31 +926,30 @@ class FrequencyAssociationDialog(simpledialog.Dialog):
             labels.append("Bin 1")
         return labels
 
-    def _pick_color(self) -> None:
+    def _pick_color(self, target_var: tk.StringVar) -> None:
         rgb, _ = colorchooser.askcolor(title="Choose EQ color")
         if rgb:
             r, g, b = map(int, rgb)
-            self.color_var.set(f"{r},{g},{b}")
+            target_var.set(f"{r},{g},{b}")
 
     def body(self, master):
         bin_labels = self._bin_labels()
-        default_bin = 0
-        if self.config and self.config.bin_index is not None:
-            default_bin = self.config.bin_index
-        default_bin = min(max(default_bin, 0), len(bin_labels) - 1)
-        ttk.Label(master, text="Frequency bin:").grid(row=0, column=0, sticky="w")
-        self.bin_var = tk.IntVar(value=default_bin)
-        self.bin_combo = ttk.Combobox(
-            master,
-            values=bin_labels,
-            textvariable=tk.StringVar(value=bin_labels[default_bin]),
-            state="readonly",
-        )
-        self.bin_combo.grid(row=0, column=1, sticky="ew")
-        self.bin_combo.bind(
-            "<<ComboboxSelected>>",
-            lambda _evt: self.bin_var.set(self.bin_combo.current()),
-        )
+        defaults = []
+        if self.config:
+            if self.config.bin_indices:
+                defaults = self.config.bin_indices
+            elif self.config.bin_index is not None:
+                defaults = [self.config.bin_index]
+        if not defaults:
+            defaults = [0]
+        ttk.Label(master, text="Frequency bins:").grid(row=0, column=0, sticky="nw")
+        bins_frame = ttk.Frame(master)
+        bins_frame.grid(row=0, column=1, sticky="w")
+        self.bin_vars: list[tk.IntVar] = []
+        for idx, label in enumerate(bin_labels):
+            var = tk.IntVar(value=1 if idx in defaults else 0)
+            self.bin_vars.append(var)
+            ttk.Checkbutton(bins_frame, text=label, variable=var).grid(row=idx // 2, column=idx % 2, sticky="w")
         master.columnconfigure(1, weight=1)
 
         ttk.Label(master, text="Mode:").grid(row=1, column=0, sticky="w", pady=(8, 0))
@@ -909,34 +968,85 @@ class FrequencyAssociationDialog(simpledialog.Dialog):
         self.gap_var = tk.StringVar(value=str(options.get("gap", 3)))
         ttk.Entry(master, textvariable=self.gap_var, width=12).grid(row=3, column=1, sticky="w", pady=(6, 0))
 
-        ttk.Label(master, text="Color (R,G,B):").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(master, text="Bar width (px):").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        self.bar_width_var = tk.StringVar(value=str(options.get("bar_width", int(self.gap_var.get() or 3) * 2)))
+        ttk.Entry(master, textvariable=self.bar_width_var, width=12).grid(row=4, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(master, text="Color (R,G,B):").grid(row=5, column=0, sticky="w", pady=(6, 0))
         self.color_var = tk.StringVar(value=str(options.get("color", "0,255,0")))
         color_row = ttk.Frame(master)
-        color_row.grid(row=4, column=1, sticky="w", pady=(6, 0))
+        color_row.grid(row=5, column=1, sticky="w", pady=(6, 0))
         ttk.Entry(color_row, textvariable=self.color_var, width=14).pack(side="left")
-        ttk.Button(color_row, text="Pick", command=self._pick_color).pack(side="left", padx=(6, 0))
+        ttk.Button(color_row, text="Pick", command=lambda: self._pick_color(self.color_var)).pack(side="left", padx=(6, 0))
+
+        ttk.Label(master, text="Fade frames:").grid(row=6, column=0, sticky="w", pady=(6, 0))
+        self.fade_frames_var = tk.StringVar(value=str(options.get("fade_frames", 8)))
+        ttk.Entry(master, textvariable=self.fade_frames_var, width=12).grid(row=6, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(master, text="Jump threshold (%):").grid(row=7, column=0, sticky="w", pady=(6, 0))
+        self.jump_threshold_var = tk.StringVar(
+            value=str(options.get("jump_threshold_percent", options.get("jump_percent", 0.0)))
+        )
+        ttk.Entry(master, textvariable=self.jump_threshold_var, width=12).grid(row=7, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(master, text="Jump window (s):").grid(row=8, column=0, sticky="w", pady=(6, 0))
+        self.jump_window_var = tk.StringVar(
+            value=str(options.get("jump_window_seconds", options.get("jump_time", 0.0)))
+        )
+        ttk.Entry(master, textvariable=self.jump_window_var, width=12).grid(row=8, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(master, text="Jump sustain (frames):").grid(row=9, column=0, sticky="w", pady=(6, 0))
+        self.jump_sustain_var = tk.StringVar(
+            value=str(options.get("jump_sustain_frames", options.get("jump_sustain", 0)))
+        )
+        ttk.Entry(master, textvariable=self.jump_sustain_var, width=12).grid(row=9, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(master, text="Jump color (R,G,B):").grid(row=10, column=0, sticky="w", pady=(6, 0))
+        self.jump_color_var = tk.StringVar(value=str(options.get("jump_color", "255,80,80")))
+        jump_color_row = ttk.Frame(master)
+        jump_color_row.grid(row=10, column=1, sticky="w", pady=(6, 0))
+        ttk.Entry(jump_color_row, textvariable=self.jump_color_var, width=14).pack(side="left")
+        ttk.Button(
+            jump_color_row,
+            text="Pick",
+            command=lambda: self._pick_color(self.jump_color_var),
+        ).pack(side="left", padx=(6, 0))
 
     def validate(self) -> bool:
         if not self.freq_doc or not self.freq_doc.bin_edges:
             messagebox.showerror("Frequency data", "No frequency bins available.")
             return False
+        if not any(var.get() for var in getattr(self, "bin_vars", [])):
+            messagebox.showerror("Frequency data", "Select at least one frequency bin.")
+            return False
         return True
 
     def apply(self) -> None:
-        bin_index = max(0, self.bin_var.get())
+        selected_bins = [idx for idx, var in enumerate(self.bin_vars) if var.get()]
+        bin_index = selected_bins[0] if len(selected_bins) == 1 else None
         options = {
             "opacity": float(self.opacity_var.get() or 1.0),
             "gap": int(self.gap_var.get() or 3),
             "color": self.color_var.get() or "0,255,0",
+            "bar_width": int(self.bar_width_var.get() or (int(self.gap_var.get() or 3) * 2)),
             "bin_index": bin_index,
+            "bin_indices": selected_bins,
+            "fade_frames": int(self.fade_frames_var.get() or 8),
+            "jump_threshold_percent": float(self.jump_threshold_var.get() or 0.0),
+            "jump_window_seconds": float(self.jump_window_var.get() or 0.0),
+            "jump_sustain_frames": int(self.jump_sustain_var.get() or 0),
+            "jump_color": self.jump_color_var.get() or "255,80,80",
         }
-        label = self._bin_labels()[bin_index if bin_index < len(self._bin_labels()) else 0]
+        labels = self._bin_labels()
+        label_parts = [labels[idx] for idx in selected_bins if idx < len(labels)]
+        label = ", ".join(label_parts) if label_parts else labels[0]
         self.result_config = AssociationConfig(
             track_name=label,
             mode=self.mode_var.get().lower(),
             options=options,
             source="frequency",
             bin_index=bin_index,
+            bin_indices=selected_bins,
         )
 
 
@@ -1450,8 +1560,22 @@ class TimedActionTool(tk.Tk):
                 gap = assoc.options.get("gap", 3)
                 opacity = assoc.options.get("opacity", 1.0)
                 color = assoc.options.get("color", "0,255,0")
-                label = assoc.track_name or self._frequency_bin_label(assoc.bin_index or 0)
-                summary = f"{label}, opacity {opacity}, gap {gap}, color {color}"
+                fade_frames = assoc.options.get("fade_frames", 8)
+                jump_threshold = assoc.options.get("jump_threshold_percent", assoc.options.get("jump_percent", 0.0))
+                jump_window = assoc.options.get("jump_window_seconds", assoc.options.get("jump_time", 0.0))
+                jump_sustain = assoc.options.get("jump_sustain_frames", assoc.options.get("jump_sustain", 0))
+                bin_indices = assoc.bin_indices or assoc.options.get("bin_indices")
+                if not bin_indices and assoc.bin_index is not None:
+                    bin_indices = [assoc.bin_index]
+                if bin_indices:
+                    labels = [self._frequency_bin_label(idx) for idx in bin_indices]
+                    label = ", ".join(labels)
+                else:
+                    label = assoc.track_name or self._frequency_bin_label(assoc.bin_index or 0)
+                summary = (
+                    f"{label}, opacity {opacity}, gap {gap}, color {color}, fade {fade_frames}f, "
+                    f"jump {jump_threshold}%/{jump_window}s x{jump_sustain}f"
+                )
             elif assoc.mode == "fireworks":
                 summary = (
                     f"Lead {assoc.options.get('pre_launch_frames', 12)}f, "
@@ -1564,14 +1688,18 @@ class TimedActionTool(tk.Tk):
             if assoc.source == "frequency":
                 if not self.frequency_doc:
                     raise RuntimeError("Load matching frequency data before rendering frequency effects.")
-                bin_index = assoc.bin_index
-                if bin_index is None:
-                    bin_index = int(assoc.options.get("bin_index", 0))
+                bin_indices = assoc.bin_indices or assoc.options.get("bin_indices")
+                if not bin_indices:
+                    bin_index = assoc.bin_index
+                    if bin_index is None:
+                        bin_index = int(assoc.options.get("bin_index", 0))
+                    bin_indices = [bin_index]
                 effect = FrequencyEQEffect(
                     freq_doc=self.frequency_doc,
-                    bin_index=bin_index,
+                    bin_indices=list(bin_indices),
                     duration=duration,
                     canvas_size=(render_settings.width, render_settings.height),
+                    fps=render_settings.fps,
                     options=assoc.options,
                 )
                 associations.append(AssociationPlan(config=assoc, effects=[effect]))
@@ -1836,6 +1964,7 @@ class TimedActionTool(tk.Tk):
                     "options": dict(assoc.options),
                     "source": assoc.source,
                     "bin_index": assoc.bin_index,
+                    "bin_indices": assoc.bin_indices,
                 }
                 for assoc in self.associations
             ],
@@ -1862,12 +1991,19 @@ class TimedActionTool(tk.Tk):
                 options = entry.get("options", {})
                 source = str(entry.get("source", "timing"))
                 bin_index = entry.get("bin_index")
+                bin_indices = entry.get("bin_indices")
                 if not track_name or not mode or not isinstance(options, dict):
                     continue
                 try:
                     parsed_bin_index = int(bin_index) if bin_index is not None else None
                 except Exception:
                     parsed_bin_index = None
+                parsed_bin_indices: Optional[list[int]] = None
+                if isinstance(bin_indices, list):
+                    try:
+                        parsed_bin_indices = [int(idx) for idx in bin_indices]
+                    except Exception:
+                        parsed_bin_indices = None
                 self.associations.append(
                     AssociationConfig(
                         track_name=str(track_name),
@@ -1875,6 +2011,7 @@ class TimedActionTool(tk.Tk):
                         options=dict(options),
                         source=source,
                         bin_index=parsed_bin_index,
+                        bin_indices=parsed_bin_indices,
                     )
                 )
         render_settings_payload = payload.get("render_settings")

@@ -421,6 +421,124 @@ class SpritePopEffect(VisualEffect):
         image.paste(sprite_img, box=top_left, mask=sprite_img)
 
 
+class PopEffect(VisualEffect):
+    def __init__(
+        self,
+        event: TimingEvent,
+        fps: int,
+        canvas_size: tuple[int, int],
+        rng: random.Random,
+        options: Dict[str, Any],
+    ) -> None:
+        self.fps = max(1, int(fps))
+        self.event_time = float(event.time)
+        self.opacity = max(0.0, min(1.0, float(options.get("opacity", 1.0))))
+        base_size = max(6.0, float(options.get("size", 36.0)))
+        if bool(options.get("use_value_for_size", False)) and event.value is not None:
+            base_size *= max(0.1, abs(float(event.value)))
+        variance = max(0.0, float(options.get("size_variance", 0.25)))
+        self.radius = max(4.0, base_size * (1 + rng.uniform(-variance, variance)))
+        self.color = tuple(rng.randint(50, 255) for _ in range(3))
+        self.alpha = int(255 * self.opacity)
+        start_from_bottom = max(0.0, min(0.95, float(options.get("start_percent_from_bottom", 0.25))))
+        width, height = canvas_size
+        max_y = height * (1.0 - start_from_bottom)
+        self.x = rng.uniform(self.radius + 4, max(self.radius + 4, width - self.radius - 4))
+        self.y = rng.uniform(self.radius + 4, max(self.radius + 4, max_y - self.radius - 4))
+        self.shards: list[dict[str, Any]] = []
+        self.shards_spawned = False
+        self.burst_window = 1.0 / float(self.fps)
+        self.gravity = 550.0
+        shard_lifetime = 1.8
+        super().__init__(0.0, self.event_time + shard_lifetime)
+        self._last_update_time = self.event_time
+        self._rng = rng
+
+    def _spawn_shards(self) -> None:
+        if self.shards_spawned:
+            return
+        self.shards_spawned = True
+        shard_count = 10
+        for _ in range(shard_count):
+            angle = self._rng.uniform(0, 2 * math.pi)
+            speed = self._rng.uniform(60.0, 160.0)
+            shard = {
+                "x": self.x,
+                "y": self.y,
+                "vx": math.cos(angle) * speed,
+                "vy": -abs(math.sin(angle) * speed * 0.6),
+                "alpha": self.alpha,
+                "radius": self._rng.uniform(self.radius * 0.12, self.radius * 0.24),
+            }
+            self.shards.append(shard)
+
+    def _update_shards(self, time_s: float) -> None:
+        delta = max(0.0, time_s - self._last_update_time)
+        if delta <= 0:
+            return
+        self._last_update_time = time_s
+        decay_steps = max(1.0, delta * self.fps)
+        decay_factor = 0.88 ** decay_steps
+        remaining: list[dict[str, Any]] = []
+        for shard in self.shards:
+            shard["vy"] += self.gravity * delta
+            shard["x"] += shard["vx"] * delta
+            shard["y"] += shard["vy"] * delta
+            shard["alpha"] = max(0, int(shard["alpha"] * decay_factor))
+            if shard["alpha"] > 2:
+                remaining.append(shard)
+        self.shards = remaining
+
+    def _draw_circle(self, draw: ImageDraw.ImageDraw) -> None:
+        box = (
+            self.x - self.radius,
+            self.y - self.radius,
+            self.x + self.radius,
+            self.y + self.radius,
+        )
+        fill = self.color + (self.alpha,)
+        draw.ellipse(box, fill=fill, outline=(0, 0, 0, self.alpha), width=2)
+
+    def _draw_star(self, draw: ImageDraw.ImageDraw, points: int = 5) -> None:
+        outer_r = self.radius * 1.2
+        inner_r = self.radius * 0.5
+        coords: list[tuple[float, float]] = []
+        for i in range(points * 2):
+            angle = math.pi / points * i - math.pi / 2
+            radius = outer_r if i % 2 == 0 else inner_r
+            coords.append((self.x + radius * math.cos(angle), self.y + radius * math.sin(angle)))
+        fill = self.color + (self.alpha,)
+        draw.polygon(coords, fill=fill, outline=(0, 0, 0, self.alpha))
+
+    def _draw_shards(self, draw: ImageDraw.ImageDraw) -> None:
+        for shard in self.shards:
+            alpha = shard["alpha"]
+            fill = self.color + (alpha,)
+            box = (
+                shard["x"] - shard["radius"],
+                shard["y"] - shard["radius"],
+                shard["x"] + shard["radius"],
+                shard["y"] + shard["radius"],
+            )
+            draw.ellipse(box, fill=fill)
+
+    def draw(self, image: Image.Image, time_s: float) -> None:  # pragma: no cover - requires human inspection
+        if time_s < self.start_time or time_s > self.end_time:
+            return
+        draw = ImageDraw.Draw(image, "RGBA")
+        if time_s < self.event_time:
+            self._draw_circle(draw)
+            return
+        if time_s <= self.event_time + self.burst_window:
+            self._spawn_shards()
+            self._draw_star(draw)
+            return
+        if not self.shards_spawned:
+            self._spawn_shards()
+        self._update_shards(time_s)
+        self._draw_shards(draw)
+
+
 class ZigZagEffect(VisualEffect):
     def __init__(
         self,
@@ -874,7 +992,7 @@ class AssociationDialog(simpledialog.Dialog):
         self.mode_var = tk.StringVar(value=(self.config.mode if self.config else "fireworks"))
         self.mode_combo = ttk.Combobox(
             master,
-            values=["fireworks", "sprite_pop", "zigzag"],
+            values=["fireworks", "sprite_pop", "pop", "zigzag"],
             textvariable=self.mode_var,
             state="readonly",
         )
@@ -914,6 +1032,19 @@ class AssociationDialog(simpledialog.Dialog):
             if self.config and self.config.mode == "sprite_pop":
                 value = self.config.options.get(key, default)
             self.sprite_vars[key] = tk.StringVar(value=str(value))
+        pop_defaults = {
+            "start_percent_from_bottom": 0.25,
+            "size": 36.0,
+            "size_variance": 0.25,
+            "use_value_for_size": False,
+            "opacity": 1.0,
+        }
+        self.pop_vars: dict[str, tk.StringVar] = {}
+        for key, default in pop_defaults.items():
+            value = default
+            if self.config and self.config.mode == "pop":
+                value = self.config.options.get(key, default)
+            self.pop_vars[key] = tk.StringVar(value=str(value))
         zigzag_defaults = {
             "line_width": 2,
             "line_width_variance": 0,
@@ -978,6 +1109,18 @@ class AssociationDialog(simpledialog.Dialog):
             ttk.Entry(self.options_frame, textvariable=self.sprite_vars["hang_time"], width=8).grid(row=3, column=1, sticky="w")
             ttk.Label(self.options_frame, text="Pre-zoom (frames):").grid(row=4, column=0, sticky="w")
             ttk.Entry(self.options_frame, textvariable=self.sprite_vars["pre_zoom_frames"], width=8).grid(row=4, column=1, sticky="w")
+        elif mode == "pop":
+            ttk.Label(self.options_frame, text="Pop options:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", columnspan=2)
+            ttk.Label(self.options_frame, text="Start offset from bottom (0-1):").grid(row=1, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.pop_vars["start_percent_from_bottom"], width=10).grid(row=1, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Base size (px):").grid(row=2, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.pop_vars["size"], width=10).grid(row=2, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Size randomness (0-1):").grid(row=3, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.pop_vars["size_variance"], width=10).grid(row=3, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Use event value for size:").grid(row=4, column=0, sticky="w")
+            ttk.Checkbutton(self.options_frame, variable=self.pop_vars["use_value_for_size"], onvalue="True", offvalue="False").grid(row=4, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Opacity (0-1):").grid(row=5, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.pop_vars["opacity"], width=10).grid(row=5, column=1, sticky="w")
         else:
             ttk.Label(self.options_frame, text="Zigzag options:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", columnspan=2)
             ttk.Label(self.options_frame, text="Line width:").grid(row=1, column=0, sticky="w")
@@ -1034,6 +1177,14 @@ class AssociationDialog(simpledialog.Dialog):
                 "scale": float(self.sprite_vars["scale"].get() or 1.0),
                 "hang_time": float(self.sprite_vars["hang_time"].get() or 0.35),
                 "pre_zoom_frames": int(self.sprite_vars["pre_zoom_frames"].get() or 5),
+            }
+        elif mode == "pop":
+            options = {
+                "start_percent_from_bottom": float(self.pop_vars["start_percent_from_bottom"].get() or 0.25),
+                "size": float(self.pop_vars["size"].get() or 36.0),
+                "size_variance": float(self.pop_vars["size_variance"].get() or 0.25),
+                "use_value_for_size": str(self.pop_vars["use_value_for_size"].get()).lower() == "true",
+                "opacity": float(self.pop_vars["opacity"].get() or 1.0),
             }
         else:
             options = {
@@ -1827,8 +1978,14 @@ class TimedActionTool(tk.Tk):
                     f"scale {assoc.options.get('scale', 1.0)}, hang {assoc.options.get('hang_time', 0.35)}s, "
                     f"pre-zoom {assoc.options.get('pre_zoom_frames', 5)}f"
                 )
-            else:
+            elif assoc.mode == "pop":
                 summary = (
+                    f"Pop start {assoc.options.get('start_percent_from_bottom', 0.25)}, "
+                    f"size {assoc.options.get('size', 36.0)}, "
+                    f"variance {assoc.options.get('size_variance', 0.25)}, "
+                    f"value->size {assoc.options.get('use_value_for_size', False)}, "
+                    f"opacity {assoc.options.get('opacity', 1.0)}"
+                )
                     f"Lines {assoc.options.get('amount', 1)}, "
                     f"align {assoc.options.get('alignment', 'both')}, "
                     f"width {assoc.options.get('line_width', 2)}, "
@@ -1955,7 +2112,10 @@ class TimedActionTool(tk.Tk):
             if not track:
                 continue
             effects: List[VisualEffect] = []
-            for event in track.events:
+            event_iterable: Iterable[TimingEvent] = track.events
+            if assoc.mode == "pop":
+                event_iterable = reversed(track.events)
+            for event in event_iterable:
                 if assoc.mode == "fireworks":
                     effects.append(
                         FireworkEffect(
@@ -1975,6 +2135,16 @@ class TimedActionTool(tk.Tk):
                             canvas_size=(render_settings.width, render_settings.height),
                             rng=rng,
                             sprite=sprite_img,
+                            options=assoc.options,
+                        )
+                    )
+                elif assoc.mode == "pop":
+                    effects.append(
+                        PopEffect(
+                            event=event,
+                            fps=render_settings.fps,
+                            canvas_size=(render_settings.width, render_settings.height),
+                            rng=rng,
                             options=assoc.options,
                         )
                     )

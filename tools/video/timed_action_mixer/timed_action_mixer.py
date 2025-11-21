@@ -552,6 +552,7 @@ class FrequencyEQEffect(VisualEffect):
         self.jump_threshold = max(0.0, float(options.get("jump_threshold_percent", options.get("jump_percent", 0.0))))
         self.jump_window_frames = max(0, int(round(float(options.get("jump_window_seconds", options.get("jump_time", 0.0))) * self.fps)))
         self.jump_sustain_frames = max(0, int(options.get("jump_sustain_frames", options.get("jump_sustain", 0))))
+        self.eq_height = max(0.0, min(1.0, float(options.get("eq_height", 1.0))))
         self.color = self._parse_color(options.get("color", "0,255,0"))
         self.jump_color = self._parse_color(options.get("jump_color", "255,80,80"))
         history_size = max(2, self.jump_window_frames + 2)
@@ -583,10 +584,13 @@ class FrequencyEQEffect(VisualEffect):
     def draw(self, image: Image.Image, time_s: float) -> None:  # pragma: no cover - visual output
         frame_idx = int(round(time_s * self.fps))
         draw = ImageDraw.Draw(image, "RGBA")
+        count = max(1, len(self.bin_indices))
+        segment_width = self.width / count
         for position, bin_index in enumerate(self.bin_indices):
             level = self.freq_doc.level_at(time_s, bin_index)
             intensity = max(0.0, min(1.0, level / 100.0))
-            bar_height = int(self.height * intensity)
+            max_bar_height = self.height * self.eq_height
+            bar_height = int(max_bar_height * intensity)
             state = self.bar_states.setdefault(
                 bin_index,
                 {
@@ -631,8 +635,10 @@ class FrequencyEQEffect(VisualEffect):
 
             color = self.jump_color if frame_idx <= state.get("jump_until", -1) else self.color
             color = color[:3] + (alpha,)
-            x0 = position * (self.bar_width + self.gap)
-            x1 = min(self.width, x0 + self.bar_width)
+            bar_width = max(2, int(min(self.bar_width, segment_width - self.gap)))
+            center = (position + 0.5) * segment_width
+            x0 = int(round(center - bar_width / 2))
+            x1 = min(self.width, x0 + bar_width)
             y0 = max(0, self.height - display_height)
             draw.rectangle((x0, y0, x1, self.height), fill=color)
 
@@ -941,7 +947,7 @@ class FrequencyAssociationDialog(simpledialog.Dialog):
             elif self.config.bin_index is not None:
                 defaults = [self.config.bin_index]
         if not defaults:
-            defaults = [0]
+            defaults = list(range(len(bin_labels))) or [0]
         ttk.Label(master, text="Frequency bins:").grid(row=0, column=0, sticky="nw")
         bins_frame = ttk.Frame(master)
         bins_frame.grid(row=0, column=1, sticky="w")
@@ -972,39 +978,43 @@ class FrequencyAssociationDialog(simpledialog.Dialog):
         self.bar_width_var = tk.StringVar(value=str(options.get("bar_width", int(self.gap_var.get() or 3) * 2)))
         ttk.Entry(master, textvariable=self.bar_width_var, width=12).grid(row=4, column=1, sticky="w", pady=(6, 0))
 
-        ttk.Label(master, text="Color (R,G,B):").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(master, text="EQ height (0-1):").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        self.eq_height_var = tk.StringVar(value=str(options.get("eq_height", 1.0)))
+        ttk.Entry(master, textvariable=self.eq_height_var, width=12).grid(row=5, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(master, text="Color (R,G,B):").grid(row=6, column=0, sticky="w", pady=(6, 0))
         self.color_var = tk.StringVar(value=str(options.get("color", "0,255,0")))
         color_row = ttk.Frame(master)
-        color_row.grid(row=5, column=1, sticky="w", pady=(6, 0))
+        color_row.grid(row=6, column=1, sticky="w", pady=(6, 0))
         ttk.Entry(color_row, textvariable=self.color_var, width=14).pack(side="left")
         ttk.Button(color_row, text="Pick", command=lambda: self._pick_color(self.color_var)).pack(side="left", padx=(6, 0))
 
-        ttk.Label(master, text="Fade frames:").grid(row=6, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(master, text="Fade frames:").grid(row=7, column=0, sticky="w", pady=(6, 0))
         self.fade_frames_var = tk.StringVar(value=str(options.get("fade_frames", 8)))
-        ttk.Entry(master, textvariable=self.fade_frames_var, width=12).grid(row=6, column=1, sticky="w", pady=(6, 0))
+        ttk.Entry(master, textvariable=self.fade_frames_var, width=12).grid(row=7, column=1, sticky="w", pady=(6, 0))
 
-        ttk.Label(master, text="Jump threshold (%):").grid(row=7, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(master, text="Jump threshold (%):").grid(row=8, column=0, sticky="w", pady=(6, 0))
         self.jump_threshold_var = tk.StringVar(
             value=str(options.get("jump_threshold_percent", options.get("jump_percent", 0.0)))
         )
-        ttk.Entry(master, textvariable=self.jump_threshold_var, width=12).grid(row=7, column=1, sticky="w", pady=(6, 0))
+        ttk.Entry(master, textvariable=self.jump_threshold_var, width=12).grid(row=8, column=1, sticky="w", pady=(6, 0))
 
-        ttk.Label(master, text="Jump window (s):").grid(row=8, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(master, text="Jump window (s):").grid(row=9, column=0, sticky="w", pady=(6, 0))
         self.jump_window_var = tk.StringVar(
             value=str(options.get("jump_window_seconds", options.get("jump_time", 0.0)))
         )
-        ttk.Entry(master, textvariable=self.jump_window_var, width=12).grid(row=8, column=1, sticky="w", pady=(6, 0))
+        ttk.Entry(master, textvariable=self.jump_window_var, width=12).grid(row=9, column=1, sticky="w", pady=(6, 0))
 
-        ttk.Label(master, text="Jump sustain (frames):").grid(row=9, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(master, text="Jump sustain (frames):").grid(row=10, column=0, sticky="w", pady=(6, 0))
         self.jump_sustain_var = tk.StringVar(
             value=str(options.get("jump_sustain_frames", options.get("jump_sustain", 0)))
         )
-        ttk.Entry(master, textvariable=self.jump_sustain_var, width=12).grid(row=9, column=1, sticky="w", pady=(6, 0))
+        ttk.Entry(master, textvariable=self.jump_sustain_var, width=12).grid(row=10, column=1, sticky="w", pady=(6, 0))
 
-        ttk.Label(master, text="Jump color (R,G,B):").grid(row=10, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(master, text="Jump color (R,G,B):").grid(row=11, column=0, sticky="w", pady=(6, 0))
         self.jump_color_var = tk.StringVar(value=str(options.get("jump_color", "255,80,80")))
         jump_color_row = ttk.Frame(master)
-        jump_color_row.grid(row=10, column=1, sticky="w", pady=(6, 0))
+        jump_color_row.grid(row=11, column=1, sticky="w", pady=(6, 0))
         ttk.Entry(jump_color_row, textvariable=self.jump_color_var, width=14).pack(side="left")
         ttk.Button(
             jump_color_row,
@@ -1029,6 +1039,7 @@ class FrequencyAssociationDialog(simpledialog.Dialog):
             "gap": int(self.gap_var.get() or 3),
             "color": self.color_var.get() or "0,255,0",
             "bar_width": int(self.bar_width_var.get() or (int(self.gap_var.get() or 3) * 2)),
+            "eq_height": float(self.eq_height_var.get() or 1.0),
             "bin_index": bin_index,
             "bin_indices": selected_bins,
             "fade_frames": int(self.fade_frames_var.get() or 8),

@@ -716,6 +716,7 @@ class FrequencyWavesEffect(VisualEffect):
         self.crash_method = str(options.get("crash_method", "vanish")).lower()
         self.base_color = self._parse_color(options.get("color", "80,180,255"))
         self.highlight_color = self._parse_color(options.get("highlight_color", "200,230,255"))
+        self.reverse_direction = bool(options.get("reverse_direction", False))
         if self.freq_doc.capture_rate:
             self.time_step = 1.0 / float(self.freq_doc.capture_rate)
         elif self.freq_doc.frames:
@@ -742,7 +743,8 @@ class FrequencyWavesEffect(VisualEffect):
         return (r, g, b, alpha)
 
     def _sample_level(self, time_s: float, bin_index: int, offset_idx: int) -> float:
-        timestamp = time_s + offset_idx * self.time_step
+        direction = -1.0 if self.reverse_direction else 1.0
+        timestamp = time_s + direction * offset_idx * self.time_step
         return self.freq_doc.level_at(timestamp, bin_index)
 
     def _draw_wave_band(
@@ -801,11 +803,17 @@ class FrequencyWavesEffect(VisualEffect):
         beach_y = min(self.height, max(horizon_y + 1, beach_y))
         depth_range = max(1.0, beach_y - horizon_y)
         for position, bin_index in enumerate(self.bin_indices):
+            offset_iterable = range(self.future_steps + 1)
+            if not self.reverse_direction:
+                offset_iterable = reversed(range(self.future_steps + 1))
             x_start = position * segment_width
             x_end = x_start + segment_width
-            for offset in reversed(range(self.future_steps + 1)):
+            for offset in offset_iterable:
                 depth_ratio = offset / float(self.future_steps)
-                y_pos = horizon_y + depth_range * (1 - depth_ratio)
+                if self.reverse_direction:
+                    y_pos = horizon_y + depth_range * depth_ratio
+                else:
+                    y_pos = horizon_y + depth_range * (1 - depth_ratio)
                 level = self._sample_level(time_s, bin_index, offset)
                 intensity = max(0.0, min(1.0, level / 100.0))
                 crest_height = self.height * 0.28 * (0.4 + 0.6 * (1 - depth_ratio)) * intensity
@@ -1178,7 +1186,14 @@ class FrequencyAssociationDialog(simpledialog.Dialog):
         self.wave_bottom_offset_var = tk.StringVar(value=str(options.get("bottom_offset", 0.0)))
         ttk.Entry(self.waves_frame, textvariable=self.wave_bottom_offset_var, width=12).grid(row=3, column=1, sticky="w", pady=(6, 0))
 
-        ttk.Label(self.waves_frame, text="Crash method:").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        self.reverse_wave_var = tk.BooleanVar(value=bool(options.get("reverse_direction", False)))
+        ttk.Checkbutton(
+            self.waves_frame,
+            text="Reverse direction (toward horizon)",
+            variable=self.reverse_wave_var,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        ttk.Label(self.waves_frame, text="Crash method:").grid(row=5, column=0, sticky="w", pady=(6, 0))
         self.crash_method_var = tk.StringVar(value=str(options.get("crash_method", "vanish")).lower())
         ttk.Combobox(
             self.waves_frame,
@@ -1186,15 +1201,15 @@ class FrequencyAssociationDialog(simpledialog.Dialog):
             textvariable=self.crash_method_var,
             state="readonly",
             width=12,
-        ).grid(row=4, column=1, sticky="w", pady=(6, 0))
+        ).grid(row=5, column=1, sticky="w", pady=(6, 0))
 
-        ttk.Label(self.waves_frame, text="Wave color (R,G,B):").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(self.waves_frame, text="Wave color (R,G,B):").grid(row=6, column=0, sticky="w", pady=(6, 0))
         self.wave_color_var = tk.StringVar(value=str(options.get("color", "80,180,255")))
-        ttk.Entry(self.waves_frame, textvariable=self.wave_color_var, width=14).grid(row=5, column=1, sticky="w", pady=(6, 0))
+        ttk.Entry(self.waves_frame, textvariable=self.wave_color_var, width=14).grid(row=6, column=1, sticky="w", pady=(6, 0))
 
-        ttk.Label(self.waves_frame, text="Highlight color (R,G,B):").grid(row=6, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(self.waves_frame, text="Highlight color (R,G,B):").grid(row=7, column=0, sticky="w", pady=(6, 0))
         self.wave_highlight_var = tk.StringVar(value=str(options.get("highlight_color", "200,230,255")))
-        ttk.Entry(self.waves_frame, textvariable=self.wave_highlight_var, width=14).grid(row=6, column=1, sticky="w", pady=(6, 0))
+        ttk.Entry(self.waves_frame, textvariable=self.wave_highlight_var, width=14).grid(row=7, column=1, sticky="w", pady=(6, 0))
 
         self._on_mode_change()
         return bins_frame
@@ -1241,6 +1256,7 @@ class FrequencyAssociationDialog(simpledialog.Dialog):
                 "crash_method": self.crash_method_var.get() or "vanish",
                 "color": self.wave_color_var.get() or "80,180,255",
                 "highlight_color": self.wave_highlight_var.get() or "200,230,255",
+                "reverse_direction": bool(self.reverse_wave_var.get()),
             }
         else:
             options = {

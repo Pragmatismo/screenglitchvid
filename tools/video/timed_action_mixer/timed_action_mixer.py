@@ -539,6 +539,113 @@ class PopEffect(VisualEffect):
         self._draw_shards(draw)
 
 
+@dataclass
+class PlantTarget:
+    center: tuple[float, float]
+    base_y: float
+
+
+class PlantEffect(VisualEffect):
+    def __init__(
+        self,
+        event: TimingEvent,
+        fps: int,
+        canvas_size: tuple[int, int],
+        rng: random.Random,
+        options: Dict[str, Any],
+        target: PlantTarget,
+        duration: float,
+        area: tuple[float, float, float, float],
+    ) -> None:
+        self.fps = max(1, int(fps))
+        self.event_time = float(event.time)
+        self.target = target
+        self.area = area
+        self.start_x = (area[0] + area[2]) / 2.0
+        self.start_y = area[3]
+        lead_frames = max(1, int(options.get("seed_lead_frames", options.get("pre_launch_frames", 12))))
+        self.lead_time = lead_frames / self.fps
+        base_grow_frames = max(1, int(options.get("grow_frames", 20)))
+        grow_variance = max(0.0, float(options.get("grow_variance", options.get("growth_variance", 0.1))))
+        grow_frames = max(1, int(round(base_grow_frames * (1 + rng.uniform(-grow_variance, grow_variance)))))
+        self.grow_time = grow_frames / self.fps
+        base_height = max(8.0, float(options.get("plant_height", options.get("height", 120.0))))
+        height_variance = max(0.0, float(options.get("height_variance", options.get("height_randomness", 0.2))))
+        self.height = base_height * (1 + rng.uniform(-height_variance, height_variance))
+        self.arc_height = max(10.0, (area[3] - area[1]) * 0.2 * (1 + rng.uniform(-0.3, 0.3)))
+        plant_type = str(options.get("plant_type", "grass")).lower()
+        choices = {"grass", "mushroom", "random"}
+        if plant_type not in choices:
+            plant_type = "grass"
+        if plant_type == "random":
+            plant_type = rng.choice(["grass", "mushroom"])
+        self.plant_type = plant_type
+        start = self.event_time - self.lead_time
+        end = max(duration, self.event_time + self.grow_time)
+        super().__init__(start, end)
+        self.seed_radius = 5.0
+        self.seed_color = (180, 140, 90, 220)
+
+    def _progress(self, now: float, start: float, duration: float) -> float:
+        if duration <= 0:
+            return 1.0
+        return max(0.0, min(1.0, (now - start) / duration))
+
+    def _draw_seed(self, draw: ImageDraw.ImageDraw, time_s: float) -> None:
+        t = self._progress(time_s, self.event_time - self.lead_time, self.lead_time)
+        if t <= 0 or t > 1:
+            return
+        cx = self.start_x + (self.target.center[0] - self.start_x) * t
+        cy = self.start_y + (self.target.center[1] - self.start_y) * t - self.arc_height * 4 * t * (1 - t)
+        r = self.seed_radius
+        draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=self.seed_color)
+
+    def _draw_grass(self, draw: ImageDraw.ImageDraw, growth: float) -> None:
+        height = self.height * growth
+        base_width = max(2.0, height * 0.08)
+        lean = (growth - 0.5) * 0.15 * self.height
+        x0 = self.target.center[0] - base_width / 2
+        x1 = self.target.center[0] + base_width / 2
+        y0 = self.target.base_y
+        tip = (self.target.center[0] + lean, max(self.area[1], y0 - height))
+        points = [(x0, y0), tip, (x1, y0)]
+        draw.polygon(points, fill=(60, 150, 60, 255))
+
+    def _draw_mushroom(self, draw: ImageDraw.ImageDraw, growth: float) -> None:
+        height = self.height * growth
+        stem_height = height * 0.65
+        cap_height = max(4.0, height * 0.35)
+        stem_width = max(3.0, height * 0.12)
+        base_y = self.target.base_y
+        stem_top_y = base_y - stem_height
+        x0 = self.target.center[0] - stem_width / 2
+        x1 = self.target.center[0] + stem_width / 2
+        draw.rectangle((x0, stem_top_y, x1, base_y), fill=(232, 224, 200, 255))
+        cap_radius_x = max(stem_width * 0.8, stem_width * 1.8)
+        cap_radius_y = cap_height
+        cap_center = (self.target.center[0], stem_top_y)
+        cap_box = (
+            cap_center[0] - cap_radius_x,
+            cap_center[1] - cap_radius_y,
+            cap_center[0] + cap_radius_x,
+            cap_center[1] + cap_radius_y,
+        )
+        draw.pieslice(cap_box, start=0, end=180, fill=(210, 90, 90, 255))
+
+    def draw(self, image: Image.Image, time_s: float) -> None:  # pragma: no cover - visual output
+        if time_s < self.start_time:
+            return
+        draw = ImageDraw.Draw(image, "RGBA")
+        if time_s < self.event_time:
+            self._draw_seed(draw, time_s)
+            return
+        growth = self._progress(time_s, self.event_time, self.grow_time)
+        if self.plant_type == "grass":
+            self._draw_grass(draw, growth)
+        else:
+            self._draw_mushroom(draw, growth)
+
+
 class ZigZagEffect(VisualEffect):
     def __init__(
         self,
@@ -992,7 +1099,7 @@ class AssociationDialog(simpledialog.Dialog):
         self.mode_var = tk.StringVar(value=(self.config.mode if self.config else "fireworks"))
         self.mode_combo = ttk.Combobox(
             master,
-            values=["fireworks", "sprite_pop", "pop", "zigzag"],
+            values=["fireworks", "sprite_pop", "pop", "plant", "zigzag"],
             textvariable=self.mode_var,
             state="readonly",
         )
@@ -1045,6 +1152,24 @@ class AssociationDialog(simpledialog.Dialog):
             if self.config and self.config.mode == "pop":
                 value = self.config.options.get(key, default)
             self.pop_vars[key] = tk.StringVar(value=str(value))
+        plant_defaults = {
+            "seed_lead_frames": 10,
+            "grow_frames": 18,
+            "plant_height": 120.0,
+            "height_variance": 0.2,
+            "grow_variance": 0.1,
+            "top_margin": 0.05,
+            "bottom_margin": 0.05,
+            "left_margin": 0.1,
+            "right_margin": 0.1,
+            "plant_type": "random",
+        }
+        self.plant_vars: dict[str, tk.StringVar] = {}
+        for key, default in plant_defaults.items():
+            value = default
+            if self.config and self.config.mode == "plant":
+                value = self.config.options.get(key, default)
+            self.plant_vars[key] = tk.StringVar(value=str(value))
         zigzag_defaults = {
             "line_width": 2,
             "line_width_variance": 0,
@@ -1121,6 +1246,36 @@ class AssociationDialog(simpledialog.Dialog):
             ttk.Checkbutton(self.options_frame, variable=self.pop_vars["use_value_for_size"], onvalue="True", offvalue="False").grid(row=4, column=1, sticky="w")
             ttk.Label(self.options_frame, text="Opacity (0-1):").grid(row=5, column=0, sticky="w")
             ttk.Entry(self.options_frame, textvariable=self.pop_vars["opacity"], width=10).grid(row=5, column=1, sticky="w")
+        elif mode == "plant":
+            ttk.Label(self.options_frame, text="Plant options:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", columnspan=2)
+            ttk.Label(self.options_frame, text="Seed lead time (frames):").grid(row=1, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.plant_vars["seed_lead_frames"], width=12).grid(row=1, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Grow duration (frames):").grid(row=2, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.plant_vars["grow_frames"], width=12).grid(row=2, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Plant height (px):").grid(row=3, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.plant_vars["plant_height"], width=12).grid(row=3, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Height randomness (0-1):").grid(row=4, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.plant_vars["height_variance"], width=12).grid(row=4, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Growth randomness (0-1):").grid(row=5, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.plant_vars["grow_variance"], width=12).grid(row=5, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Top/Bottom margin (0-0.45):").grid(row=6, column=0, sticky="w")
+            margin_row = ttk.Frame(self.options_frame)
+            margin_row.grid(row=6, column=1, sticky="w")
+            ttk.Entry(margin_row, textvariable=self.plant_vars["top_margin"], width=6).pack(side="left")
+            ttk.Entry(margin_row, textvariable=self.plant_vars["bottom_margin"], width=6).pack(side="left", padx=(6, 0))
+            ttk.Label(self.options_frame, text="Left/Right margin (0-0.45):").grid(row=7, column=0, sticky="w")
+            margin_row_lr = ttk.Frame(self.options_frame)
+            margin_row_lr.grid(row=7, column=1, sticky="w")
+            ttk.Entry(margin_row_lr, textvariable=self.plant_vars["left_margin"], width=6).pack(side="left")
+            ttk.Entry(margin_row_lr, textvariable=self.plant_vars["right_margin"], width=6).pack(side="left", padx=(6, 0))
+            ttk.Label(self.options_frame, text="Plant type:").grid(row=8, column=0, sticky="w")
+            ttk.Combobox(
+                self.options_frame,
+                values=["random", "grass", "mushroom"],
+                textvariable=self.plant_vars["plant_type"],
+                state="readonly",
+                width=12,
+            ).grid(row=8, column=1, sticky="w")
         else:
             ttk.Label(self.options_frame, text="Zigzag options:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", columnspan=2)
             ttk.Label(self.options_frame, text="Line width:").grid(row=1, column=0, sticky="w")
@@ -1185,6 +1340,19 @@ class AssociationDialog(simpledialog.Dialog):
                 "size_variance": float(self.pop_vars["size_variance"].get() or 0.25),
                 "use_value_for_size": str(self.pop_vars["use_value_for_size"].get()).lower() == "true",
                 "opacity": float(self.pop_vars["opacity"].get() or 1.0),
+            }
+        elif mode == "plant":
+            options = {
+                "seed_lead_frames": int(self.plant_vars["seed_lead_frames"].get() or 10),
+                "grow_frames": int(self.plant_vars["grow_frames"].get() or 18),
+                "plant_height": float(self.plant_vars["plant_height"].get() or 120.0),
+                "height_variance": float(self.plant_vars["height_variance"].get() or 0.2),
+                "grow_variance": float(self.plant_vars["grow_variance"].get() or 0.1),
+                "top_margin": float(self.plant_vars["top_margin"].get() or 0.05),
+                "bottom_margin": float(self.plant_vars["bottom_margin"].get() or 0.05),
+                "left_margin": float(self.plant_vars["left_margin"].get() or 0.1),
+                "right_margin": float(self.plant_vars["right_margin"].get() or 0.1),
+                "plant_type": self.plant_vars["plant_type"].get() or "random",
             }
         else:
             options = {
@@ -1986,6 +2154,15 @@ class TimedActionTool(tk.Tk):
                     f"value->size {assoc.options.get('use_value_for_size', False)}, "
                     f"opacity {assoc.options.get('opacity', 1.0)}"
                 )
+            elif assoc.mode == "plant":
+                summary = (
+                    f"Seed lead {assoc.options.get('seed_lead_frames', 10)}f, "
+                    f"grow {assoc.options.get('grow_frames', 18)}f, "
+                    f"height {assoc.options.get('plant_height', 120.0)}, "
+                    f"type {assoc.options.get('plant_type', 'random')}"
+                )
+            else:
+                summary = (
                     f"Lines {assoc.options.get('amount', 1)}, "
                     f"align {assoc.options.get('alignment', 'both')}, "
                     f"width {assoc.options.get('line_width', 2)}, "
@@ -2055,6 +2232,64 @@ class TimedActionTool(tk.Tk):
         self._refresh_assoc_tree()
 
     # ------------------------------------------------------------------
+    def _plant_area(self, options: Dict[str, Any], canvas_size: tuple[int, int]) -> tuple[float, float, float, float]:
+        width, height = canvas_size
+        def _pct(key: str, default: float) -> float:
+            try:
+                value = float(options.get(key, default))
+            except Exception:
+                value = default
+            return max(0.0, min(0.45, value))
+
+        top = _pct("top_margin", 0.05)
+        bottom = _pct("bottom_margin", 0.05)
+        left = _pct("left_margin", 0.1)
+        right = _pct("right_margin", 0.1)
+        x0 = width * left
+        x1 = width * (1.0 - right)
+        y0 = height * top
+        y1 = height * (1.0 - bottom)
+        if x1 - x0 < width * 0.1:
+            area_width = width * 0.1
+            x0 = (width - area_width) / 2.0
+            x1 = x0 + area_width
+        if y1 - y0 < height * 0.1:
+            area_height = height * 0.1
+            y0 = (height - area_height) / 2.0
+            y1 = y0 + area_height
+        return (x0, y0, x1, y1)
+
+    def _plan_plant_targets(
+        self,
+        events: list[TimingEvent],
+        canvas_size: tuple[int, int],
+        options: Dict[str, Any],
+        rng: random.Random,
+    ) -> tuple[list[PlantTarget], tuple[float, float, float, float]]:
+        area = self._plant_area(options, canvas_size)
+        area_width = area[2] - area[0]
+        area_height = area[3] - area[1]
+        cells = max(1, len(events) * 2)
+        cols = max(1, int(math.sqrt(cells)))
+        rows = math.ceil(cells / cols)
+        cell_width = area_width / cols
+        cell_height = area_height / rows
+        available_cells = [(r, c) for r in range(rows) for c in range(cols)]
+        rng.shuffle(available_cells)
+        targets: list[PlantTarget] = []
+        for event in events:
+            if available_cells:
+                row, col = available_cells.pop()
+            else:
+                row = rng.randrange(rows)
+                col = rng.randrange(cols)
+            center_x = area[0] + (col + 0.5) * cell_width
+            center_y = area[1] + (row + 0.5) * cell_height
+            base_y = min(area[3], area[1] + (row + 1) * cell_height)
+            targets.append(PlantTarget(center=(center_x, center_y), base_y=base_y))
+        return targets, area
+
+    # ------------------------------------------------------------------
     def _build_render_plan(self) -> RenderPlan:
         if not self.associations:
             raise RuntimeError("Add at least one association before rendering.")
@@ -2115,6 +2350,15 @@ class TimedActionTool(tk.Tk):
             event_iterable: Iterable[TimingEvent] = track.events
             if assoc.mode == "pop":
                 event_iterable = reversed(track.events)
+            plant_targets: list[PlantTarget] = []
+            plant_area: Optional[tuple[float, float, float, float]] = None
+            if assoc.mode == "plant":
+                plant_targets, plant_area = self._plan_plant_targets(
+                    track.events,
+                    (render_settings.width, render_settings.height),
+                    assoc.options,
+                    rng,
+                )
             for event in event_iterable:
                 if assoc.mode == "fireworks":
                     effects.append(
@@ -2146,6 +2390,28 @@ class TimedActionTool(tk.Tk):
                             canvas_size=(render_settings.width, render_settings.height),
                             rng=rng,
                             options=assoc.options,
+                        )
+                    )
+                elif assoc.mode == "plant":
+                    if not plant_targets:
+                        plant_targets, plant_area = self._plan_plant_targets(
+                            track.events,
+                            (render_settings.width, render_settings.height),
+                            assoc.options,
+                            rng,
+                        )
+                    target = plant_targets.pop(0)
+                    assert plant_area is not None
+                    effects.append(
+                        PlantEffect(
+                            event=event,
+                            fps=render_settings.fps,
+                            canvas_size=(render_settings.width, render_settings.height),
+                            rng=rng,
+                            options=assoc.options,
+                            target=target,
+                            duration=duration,
+                            area=plant_area,
                         )
                     )
                 else:

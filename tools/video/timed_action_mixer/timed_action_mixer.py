@@ -539,6 +539,162 @@ class PopEffect(VisualEffect):
         self._draw_shards(draw)
 
 
+class SplashEffect(VisualEffect):
+    def __init__(
+        self,
+        event: TimingEvent,
+        fps: int,
+        canvas_size: tuple[int, int],
+        rng: random.Random,
+        options: Dict[str, Any],
+    ) -> None:
+        self.fps = max(1, int(fps))
+        self.event_time = float(event.time)
+        width, height = canvas_size
+        self.color = self._parse_color(options.get("color", "150,200,255"))
+        base_start_size = max(2.0, float(options.get("start_size", 28.0)))
+        base_impact_size = max(2.0, float(options.get("impact_size", 10.0)))
+        size_variance = max(0.0, float(options.get("size_variance", 0.25)))
+        self.start_size = base_start_size * (1 + rng.uniform(-size_variance, size_variance))
+        self.impact_size = base_impact_size * (1 + rng.uniform(-size_variance, size_variance))
+        speed_variance = max(0.0, float(options.get("speed_variance", 0.2)))
+        base_motion_frames = max(2, int(options.get("motion_frames", 10)))
+        varied_frames = int(round(base_motion_frames * (1 + rng.uniform(-speed_variance, speed_variance))))
+        self.motion_frames = max(2, varied_frames)
+        self.fall_duration = self.motion_frames / self.fps
+        self.splash_duration = 0.9
+        self.impact_x = rng.uniform(width * 0.15, width * 0.85)
+        self.impact_y = rng.uniform(height * 0.35, height * 0.9)
+        fall_distance = height * rng.uniform(0.12, 0.28)
+        self.start_x = self.impact_x + rng.uniform(-20.0, 20.0)
+        self.start_y = max(0.0, self.impact_y - fall_distance)
+        self.drift_x = rng.uniform(-18.0, 18.0)
+        burst_count = max(3.0, float(options.get("burst_count", 14)))
+        burst_count_variance = max(0.0, float(options.get("burst_count_variance", 0.25)))
+        self.burst_count = max(3, int(round(burst_count * (1 + rng.uniform(-burst_count_variance, burst_count_variance)))))
+        self.burst_distance = max(10.0, float(options.get("burst_distance", 140.0)))
+        self.burst_distance_variance = max(0.0, float(options.get("burst_distance_variance", 0.35)))
+        start = self.event_time - self.fall_duration
+        end = self.event_time + self.splash_duration
+        super().__init__(start, end)
+        self.particles: list[dict[str, Any]] = []
+        self.splash_spawned = False
+        self._last_update_time = self.event_time
+        self._rng = rng
+
+    def _parse_color(self, value: Any) -> tuple[int, int, int, int]:
+        try:
+            if isinstance(value, (list, tuple)) and len(value) >= 3:
+                r, g, b = value[:3]
+            else:
+                parts = str(value).split(",")
+                r, g, b = (int(float(parts[i])) for i in range(3))
+            r = max(0, min(255, int(r)))
+            g = max(0, min(255, int(g)))
+            b = max(0, min(255, int(b)))
+        except Exception:
+            r, g, b = 150, 200, 255
+        return (r, g, b, 230)
+
+    def _spawn_splash(self) -> None:
+        if self.splash_spawned:
+            return
+        self.splash_spawned = True
+        distance = self.burst_distance * (1 + self._rng.uniform(-self.burst_distance_variance, self.burst_distance_variance))
+        distance = max(6.0, distance)
+        fade = max(0.35, self.splash_duration * 0.85)
+        for _ in range(self.burst_count):
+            angle = self._rng.uniform(0, math.tau)
+            speed = distance / fade
+            jitter = 0.6 + self._rng.random() * 0.8
+            vx = math.cos(angle) * speed * jitter
+            vy = math.sin(angle) * speed * jitter
+            radius = max(1.0, self.impact_size * (0.2 + self._rng.random() * 0.45))
+            self.particles.append(
+                {
+                    "x": self.impact_x,
+                    "y": self.impact_y,
+                    "vx": vx,
+                    "vy": vy,
+                    "alpha": 255,
+                    "radius": radius,
+                    "age": 0.0,
+                    "life": fade,
+                }
+            )
+
+    def _update_particles(self, time_s: float) -> None:
+        delta = max(0.0, time_s - self._last_update_time)
+        if delta <= 0:
+            return
+        self._last_update_time = time_s
+        decay_steps = max(1.0, delta * self.fps)
+        decay_factor = 0.9 ** decay_steps
+        remaining: list[dict[str, Any]] = []
+        for particle in self.particles:
+            particle["x"] += particle["vx"] * delta
+            particle["y"] += particle["vy"] * delta
+            particle["vx"] *= decay_factor
+            particle["vy"] *= decay_factor
+            particle["age"] += delta
+            particle["alpha"] = max(0, int(255 * max(0.0, 1.0 - particle["age"] / particle["life"])))
+            if particle["alpha"] > 2:
+                remaining.append(particle)
+        self.particles = remaining
+
+    def _draw_drop(self, draw: ImageDraw.ImageDraw, progress: float) -> None:
+        x = self.start_x + (self.impact_x - self.start_x) * progress + self.drift_x * (progress**1.2)
+        y = self.start_y + (self.impact_y - self.start_y) * progress
+        size = self.start_size + (self.impact_size - self.start_size) * progress
+        radius = size / 2.0
+        alpha = int(self.color[3] * (0.75 + 0.25 * (1.0 - progress)))
+        color = self.color[:3] + (alpha,)
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color)
+        glint_radius = max(1.0, radius * 0.45)
+        draw.ellipse(
+            (x - glint_radius, y - glint_radius, x + glint_radius, y + glint_radius),
+            fill=self.color[:3] + (min(255, int(alpha * 0.8)),),
+        )
+
+    def _draw_splash(self, draw: ImageDraw.ImageDraw) -> None:
+        for particle in self.particles:
+            radius = particle["radius"] * (0.6 + 0.4 * max(0.0, 1.0 - particle["age"] / particle["life"]))
+            color = self.color[:3] + (particle["alpha"],)
+            box = (
+                particle["x"] - radius,
+                particle["y"] - radius,
+                particle["x"] + radius,
+                particle["y"] + radius,
+            )
+            draw.ellipse(box, fill=color)
+
+    def draw(self, image: Image.Image, time_s: float) -> None:  # pragma: no cover - visual output
+        if time_s < self.start_time or time_s > self.end_time:
+            return
+        draw = ImageDraw.Draw(image, "RGBA")
+        if time_s < self.event_time:
+            if self.fall_duration > 0:
+                progress = max(0.0, min(1.0, (time_s - self.start_time) / self.fall_duration))
+            else:
+                progress = 1.0
+            self._draw_drop(draw, progress)
+            return
+        if not self.splash_spawned:
+            self._spawn_splash()
+        self._update_particles(time_s)
+        if time_s - self.event_time < 0.12:
+            draw.ellipse(
+                (
+                    self.impact_x - self.impact_size,
+                    self.impact_y - self.impact_size,
+                    self.impact_x + self.impact_size,
+                    self.impact_y + self.impact_size,
+                ),
+                fill=self.color[:3] + (self.color[3],),
+            )
+        self._draw_splash(draw)
+
+
 @dataclass
 class PlantTarget:
     center: tuple[float, float]
@@ -1289,7 +1445,7 @@ class AssociationDialog(simpledialog.Dialog):
         self.mode_var = tk.StringVar(value=(self.config.mode if self.config else "fireworks"))
         self.mode_combo = ttk.Combobox(
             master,
-            values=["fireworks", "sprite_pop", "pop", "plant", "wall", "zigzag"],
+            values=["fireworks", "sprite_pop", "pop", "splash", "plant", "wall", "zigzag"],
             textvariable=self.mode_var,
             state="readonly",
         )
@@ -1342,6 +1498,24 @@ class AssociationDialog(simpledialog.Dialog):
             if self.config and self.config.mode == "pop":
                 value = self.config.options.get(key, default)
             self.pop_vars[key] = tk.StringVar(value=str(value))
+        splash_defaults = {
+            "start_size": 28.0,
+            "impact_size": 10.0,
+            "size_variance": 0.25,
+            "speed_variance": 0.2,
+            "motion_frames": 10,
+            "color": "150,200,255",
+            "burst_count": 14,
+            "burst_count_variance": 0.25,
+            "burst_distance": 140.0,
+            "burst_distance_variance": 0.35,
+        }
+        self.splash_vars: dict[str, tk.StringVar] = {}
+        for key, default in splash_defaults.items():
+            value = default
+            if self.config and self.config.mode == "splash":
+                value = self.config.options.get(key, default)
+            self.splash_vars[key] = tk.StringVar(value=str(value))
         plant_defaults = {
             "seed_lead_frames": 10,
             "grow_frames": 18,
@@ -1447,6 +1621,28 @@ class AssociationDialog(simpledialog.Dialog):
             ttk.Checkbutton(self.options_frame, variable=self.pop_vars["use_value_for_size"], onvalue="True", offvalue="False").grid(row=4, column=1, sticky="w")
             ttk.Label(self.options_frame, text="Opacity (0-1):").grid(row=5, column=0, sticky="w")
             ttk.Entry(self.options_frame, textvariable=self.pop_vars["opacity"], width=10).grid(row=5, column=1, sticky="w")
+        elif mode == "splash":
+            ttk.Label(self.options_frame, text="Splash options:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", columnspan=2)
+            ttk.Label(self.options_frame, text="Start size (px):").grid(row=1, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.splash_vars["start_size"], width=10).grid(row=1, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Impact size (px):").grid(row=2, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.splash_vars["impact_size"], width=10).grid(row=2, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Size randomness (0-1):").grid(row=3, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.splash_vars["size_variance"], width=10).grid(row=3, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Speed randomness (0-1):").grid(row=4, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.splash_vars["speed_variance"], width=10).grid(row=4, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Frames before impact:").grid(row=5, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.splash_vars["motion_frames"], width=10).grid(row=5, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Drop color (R,G,B):").grid(row=6, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.splash_vars["color"], width=12).grid(row=6, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Burst drops (approx):").grid(row=7, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.splash_vars["burst_count"], width=12).grid(row=7, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Burst count randomness (0-1):").grid(row=8, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.splash_vars["burst_count_variance"], width=12).grid(row=8, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Max travel distance (px):").grid(row=9, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.splash_vars["burst_distance"], width=12).grid(row=9, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Distance randomness (0-1):").grid(row=10, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.splash_vars["burst_distance_variance"], width=12).grid(row=10, column=1, sticky="w")
         elif mode == "plant":
             ttk.Label(self.options_frame, text="Plant options:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", columnspan=2)
             ttk.Label(self.options_frame, text="Seed lead time (frames):").grid(row=1, column=0, sticky="w")
@@ -1549,6 +1745,19 @@ class AssociationDialog(simpledialog.Dialog):
                 "size_variance": float(self.pop_vars["size_variance"].get() or 0.25),
                 "use_value_for_size": str(self.pop_vars["use_value_for_size"].get()).lower() == "true",
                 "opacity": float(self.pop_vars["opacity"].get() or 1.0),
+            }
+        elif mode == "splash":
+            options = {
+                "start_size": float(self.splash_vars["start_size"].get() or 28.0),
+                "impact_size": float(self.splash_vars["impact_size"].get() or 10.0),
+                "size_variance": float(self.splash_vars["size_variance"].get() or 0.25),
+                "speed_variance": float(self.splash_vars["speed_variance"].get() or 0.2),
+                "motion_frames": int(self.splash_vars["motion_frames"].get() or 10),
+                "color": self.splash_vars["color"].get() or "150,200,255",
+                "burst_count": float(self.splash_vars["burst_count"].get() or 14),
+                "burst_count_variance": float(self.splash_vars["burst_count_variance"].get() or 0.25),
+                "burst_distance": float(self.splash_vars["burst_distance"].get() or 140.0),
+                "burst_distance_variance": float(self.splash_vars["burst_distance_variance"].get() or 0.35),
             }
         elif mode == "plant":
             options = {
@@ -2455,6 +2664,13 @@ class TimedActionTool(tk.Tk):
                     f"value->size {assoc.options.get('use_value_for_size', False)}, "
                     f"opacity {assoc.options.get('opacity', 1.0)}"
                 )
+            elif assoc.mode == "splash":
+                summary = (
+                    f"Start {assoc.options.get('start_size', 28.0)}px -> {assoc.options.get('impact_size', 10.0)}px, "
+                    f"frames {assoc.options.get('motion_frames', 10)}, color {assoc.options.get('color', '150,200,255')}, "
+                    f"burst {assoc.options.get('burst_count', 14)}±{assoc.options.get('burst_count_variance', 0.25)}, "
+                    f"range {assoc.options.get('burst_distance', 140.0)}±{assoc.options.get('burst_distance_variance', 0.35)}"
+                )
             elif assoc.mode == "plant":
                 summary = (
                     f"Seed lead {assoc.options.get('seed_lead_frames', 10)}f, "
@@ -2707,6 +2923,16 @@ class TimedActionTool(tk.Tk):
                 elif assoc.mode == "pop":
                     effects.append(
                         PopEffect(
+                            event=event,
+                            fps=render_settings.fps,
+                            canvas_size=(render_settings.width, render_settings.height),
+                            rng=rng,
+                            options=assoc.options,
+                        )
+                    )
+                elif assoc.mode == "splash":
+                    effects.append(
+                        SplashEffect(
                             event=event,
                             fps=render_settings.fps,
                             canvas_size=(render_settings.width, render_settings.height),

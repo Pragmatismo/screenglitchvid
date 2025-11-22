@@ -643,7 +643,7 @@ class PlantEffect(VisualEffect):
         if self.plant_type == "grass":
             self._draw_grass(draw, growth)
         else:
-        self._draw_mushroom(draw, growth)
+            self._draw_mushroom(draw, growth)
 
 
 class WallEffect(VisualEffect):
@@ -1133,6 +1133,125 @@ class FrequencyWavesEffect(VisualEffect):
                 self._draw_particles(draw, bin_index)
 
 
+class FrequencyRainEffect(VisualEffect):
+    def __init__(
+        self,
+        freq_doc: FrequencyDocument,
+        bin_indices: list[int],
+        duration: float,
+        canvas_size: tuple[int, int],
+        fps: int,
+        options: Dict[str, Any],
+    ) -> None:
+        super().__init__(0.0, duration)
+        self.freq_doc = freq_doc
+        self.bin_indices = [max(0, int(idx)) for idx in bin_indices] or [0]
+        self.width, self.height = canvas_size
+        self.fps = max(1, int(fps))
+        self.opacity = max(0.0, min(1.0, float(options.get("opacity", 0.85))))
+        self.base_density = max(0.0, float(options.get("base_density", 2.0)))
+        self.density_multiplier = max(0.0, float(options.get("density_multiplier", 2.0)))
+        self.min_transit_frames = max(1, int(options.get("rain_transit_min", 12)))
+        self.max_transit_frames = max(self.min_transit_frames, int(options.get("rain_transit_max", 36)))
+        self.drop_size = max(0.5, float(options.get("drop_size", 3.0)))
+        self.drop_variance = max(1.0, float(options.get("drop_variance", 1.6)))
+        self.color_variance = max(0.0, float(options.get("color_variance", 0.0)))
+        self.base_color = self._parse_color(options.get("color", "140,200,255"))
+        self.rng = random.Random(42)
+        self.bin_colors: dict[int, tuple[int, int, int]] = {}
+        seed_color = self._vary_color(self.base_color, max(self.color_variance, 8.0))
+        for position, idx in enumerate(self.bin_indices):
+            factor = max(0.35, 1.0 - position * 0.12)
+            tinted = tuple(max(0, min(255, int(channel * factor))) for channel in seed_color)
+            self.bin_colors[idx] = tinted
+        self.drops: list[dict[str, Any]] = []
+
+    def _parse_color(self, value: Any) -> tuple[int, int, int]:
+        try:
+            if isinstance(value, (list, tuple)) and len(value) >= 3:
+                r, g, b = value[:3]
+            else:
+                parts = str(value).split(",")
+                r, g, b = (int(float(parts[i])) for i in range(3))
+            r = max(0, min(255, int(r)))
+            g = max(0, min(255, int(g)))
+            b = max(0, min(255, int(b)))
+        except Exception:
+            r, g, b = 140, 200, 255
+        return r, g, b
+
+    def _vary_color(self, base: tuple[int, int, int], variance: float) -> tuple[int, int, int]:
+        return tuple(
+            max(0, min(255, int(channel + self.rng.uniform(-variance, variance)))) for channel in base
+        )
+
+    def _transit_frames(self, intensity: float) -> int:
+        if intensity <= 0.0:
+            return self.max_transit_frames
+        clamped = max(0.01, min(1.0, intensity))
+        span = max(0, self.max_transit_frames - self.min_transit_frames)
+        if span == 0:
+            return self.min_transit_frames
+        return int(round(self.max_transit_frames - span * ((clamped - 0.01) / 0.99)))
+
+    def _spawn_for_bin(self, time_s: float, bin_index: int, base_color: tuple[int, int, int]) -> None:
+        level = self.freq_doc.level_at(time_s, bin_index)
+        intensity = max(0.0, min(1.0, level / 100.0))
+        if intensity <= 0.0:
+            return
+        transit_frames = self._transit_frames(intensity)
+        speed = self.height / float(transit_frames)
+        count = self.base_density * (1.0 + (self.density_multiplier - 1.0) * intensity)
+        drop_count = int(count)
+        if self.rng.random() < (count - drop_count):
+            drop_count += 1
+        stretch_ratio = 0.0
+        if self.max_transit_frames != self.min_transit_frames:
+            stretch_ratio = (self.max_transit_frames - transit_frames) / (self.max_transit_frames - self.min_transit_frames)
+        for _ in range(drop_count):
+            size = self.drop_size * self.rng.uniform(1.0, self.drop_variance)
+            length = size * (1.0 + stretch_ratio * 5.0)
+            alpha = int(255 * self.opacity * (0.5 + 0.5 * intensity))
+            color = self._vary_color(base_color, self.color_variance) + (alpha,)
+            self.drops.append(
+                {
+                    "x": self.rng.uniform(0, self.width),
+                    "y": self.rng.uniform(-length, 0.0),
+                    "vy": speed,
+                    "size": size,
+                    "length": length,
+                    "color": color,
+                }
+            )
+
+    def draw(self, image: Image.Image, time_s: float) -> None:  # pragma: no cover - visual output
+        for bin_index in self.bin_indices:
+            base_color = self.bin_colors.get(bin_index, self.base_color)
+            self._spawn_for_bin(time_s, bin_index, base_color)
+
+        draw = ImageDraw.Draw(image, "RGBA")
+        remaining: list[dict[str, Any]] = []
+        for drop in self.drops:
+            drop["y"] += drop["vy"]
+            if drop["y"] - drop["length"] > self.height:
+                continue
+            x = drop["x"]
+            y = drop["y"]
+            size = drop["size"]
+            length = drop["length"]
+            color = drop["color"]
+            if length <= size * 1.2:
+                radius = size / 2.0
+                draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color)
+            else:
+                width = max(1, int(size * 0.7))
+                draw.line((x, y - length, x, y), fill=color, width=width)
+                radius = size / 2.0
+                draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color)
+            remaining.append(drop)
+        self.drops = remaining
+
+
 # ---------------------------------------------------------------------------
 # GUI components
 # ---------------------------------------------------------------------------
@@ -1498,11 +1617,14 @@ class FrequencyAssociationDialog(simpledialog.Dialog):
 
     def _on_mode_change(self, _event=None) -> None:
         mode = self.mode_var.get().lower()
+        self.eq_frame.grid_remove()
+        self.waves_frame.grid_remove()
+        self.rain_frame.grid_remove()
         if mode == "waves":
-            self.eq_frame.grid_remove()
             self.waves_frame.grid()
+        elif mode == "rain":
+            self.rain_frame.grid()
         else:
-            self.waves_frame.grid_remove()
             self.eq_frame.grid()
 
     def body(self, master):
@@ -1528,13 +1650,15 @@ class FrequencyAssociationDialog(simpledialog.Dialog):
         ttk.Label(master, text="Mode:").grid(row=1, column=0, sticky="w", pady=(8, 0))
         default_mode = (self.config.mode.upper() if self.config else "EQ")
         self.mode_var = tk.StringVar(value=default_mode)
-        mode_combo = ttk.Combobox(master, values=["EQ", "WAVES"], textvariable=self.mode_var, state="readonly")
+        mode_combo = ttk.Combobox(master, values=["EQ", "WAVES", "RAIN"], textvariable=self.mode_var, state="readonly")
         mode_combo.grid(row=1, column=1, sticky="ew", pady=(8, 0))
         mode_combo.bind("<<ComboboxSelected>>", self._on_mode_change)
 
         options = self.config.options if self.config else {}
         self.opacity_var = tk.StringVar(value=str(options.get("opacity", 1.0)))
         self.color_var = tk.StringVar(value=str(options.get("color", "0,255,0")))
+        self.rain_color_var = tk.StringVar(value=str(options.get("color", "140,200,255")))
+        self.rain_color_variance_var = tk.StringVar(value=str(options.get("color_variance", 0)))
 
         self.eq_frame = ttk.LabelFrame(master, text="EQ options")
         self.eq_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
@@ -1626,6 +1750,44 @@ class FrequencyAssociationDialog(simpledialog.Dialog):
         self.wave_highlight_var = tk.StringVar(value=str(options.get("highlight_color", "200,230,255")))
         ttk.Entry(self.waves_frame, textvariable=self.wave_highlight_var, width=14).grid(row=7, column=1, sticky="w", pady=(6, 0))
 
+        self.rain_frame = ttk.LabelFrame(master, text="Rain options")
+        self.rain_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(self.rain_frame, text="Opacity (0-1):").grid(row=0, column=0, sticky="w", pady=(2, 0))
+        ttk.Entry(self.rain_frame, textvariable=self.opacity_var, width=12).grid(row=0, column=1, sticky="w", pady=(2, 0))
+
+        ttk.Label(self.rain_frame, text="Base rain density:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.base_density_var = tk.StringVar(value=str(options.get("base_density", 2.0)))
+        ttk.Entry(self.rain_frame, textvariable=self.base_density_var, width=12).grid(row=1, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(self.rain_frame, text="Density multiplier:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.density_multiplier_var = tk.StringVar(value=str(options.get("density_multiplier", 2.0)))
+        ttk.Entry(self.rain_frame, textvariable=self.density_multiplier_var, width=12).grid(row=2, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(self.rain_frame, text="Rain transit min (frames):").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        self.rain_min_var = tk.StringVar(value=str(options.get("rain_transit_min", 12)))
+        ttk.Entry(self.rain_frame, textvariable=self.rain_min_var, width=12).grid(row=3, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(self.rain_frame, text="Rain transit max (frames):").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        self.rain_max_var = tk.StringVar(value=str(options.get("rain_transit_max", 36)))
+        ttk.Entry(self.rain_frame, textvariable=self.rain_max_var, width=12).grid(row=4, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(self.rain_frame, text="Drop size (px):").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        self.drop_size_var = tk.StringVar(value=str(options.get("drop_size", 3.0)))
+        ttk.Entry(self.rain_frame, textvariable=self.drop_size_var, width=12).grid(row=5, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(self.rain_frame, text="Drop variance (x):").grid(row=6, column=0, sticky="w", pady=(6, 0))
+        self.drop_variance_var = tk.StringVar(value=str(options.get("drop_variance", 1.6)))
+        ttk.Entry(self.rain_frame, textvariable=self.drop_variance_var, width=12).grid(row=6, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(self.rain_frame, text="Color (R,G,B):").grid(row=7, column=0, sticky="w", pady=(6, 0))
+        rain_color_row = ttk.Frame(self.rain_frame)
+        rain_color_row.grid(row=7, column=1, sticky="w", pady=(6, 0))
+        ttk.Entry(rain_color_row, textvariable=self.rain_color_var, width=14).pack(side="left")
+        ttk.Button(rain_color_row, text="Pick", command=lambda: self._pick_color(self.rain_color_var)).pack(side="left", padx=(6, 0))
+
+        ttk.Label(self.rain_frame, text="Color variance:").grid(row=8, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(self.rain_frame, textvariable=self.rain_color_variance_var, width=12).grid(row=8, column=1, sticky="w", pady=(6, 0))
+
         self._on_mode_change()
         return bins_frame
 
@@ -1643,6 +1805,14 @@ class FrequencyAssociationDialog(simpledialog.Dialog):
                 int(self.wave_depth_var.get() or 1)
                 float(self.wave_horizon_var.get() or 0.5)
                 float(self.wave_bottom_offset_var.get() or 0.0)
+            elif mode == "rain":
+                float(self.base_density_var.get() or 0.0)
+                float(self.density_multiplier_var.get() or 1.0)
+                int(self.rain_min_var.get() or 1)
+                int(self.rain_max_var.get() or 1)
+                float(self.drop_size_var.get() or 1.0)
+                float(self.drop_variance_var.get() or 1.0)
+                float(self.rain_color_variance_var.get() or 0.0)
             else:
                 int(self.gap_var.get() or 3)
                 int(self.bar_width_var.get() or 2)
@@ -1672,6 +1842,20 @@ class FrequencyAssociationDialog(simpledialog.Dialog):
                 "color": self.wave_color_var.get() or "80,180,255",
                 "highlight_color": self.wave_highlight_var.get() or "200,230,255",
                 "reverse_direction": bool(self.reverse_wave_var.get()),
+            }
+        elif mode == "rain":
+            options = {
+                "opacity": float(self.opacity_var.get() or 1.0),
+                "bin_index": bin_index,
+                "bin_indices": selected_bins,
+                "base_density": float(self.base_density_var.get() or 0.0),
+                "density_multiplier": float(self.density_multiplier_var.get() or 1.0),
+                "rain_transit_min": int(self.rain_min_var.get() or 1),
+                "rain_transit_max": int(self.rain_max_var.get() or 1),
+                "drop_size": float(self.drop_size_var.get() or 1.0),
+                "drop_variance": float(self.drop_variance_var.get() or 1.0),
+                "color": self.rain_color_var.get() or "140,200,255",
+                "color_variance": float(self.rain_color_variance_var.get() or 0.0),
             }
         else:
             options = {
@@ -2208,13 +2392,6 @@ class TimedActionTool(tk.Tk):
             self.assoc_tree.delete(item)
         for idx, assoc in enumerate(self.associations):
             if assoc.source == "frequency":
-                gap = assoc.options.get("gap", 3)
-                opacity = assoc.options.get("opacity", 1.0)
-                color = assoc.options.get("color", "0,255,0")
-                fade_frames = assoc.options.get("fade_frames", 8)
-                jump_threshold = assoc.options.get("jump_threshold_percent", assoc.options.get("jump_percent", 0.0))
-                jump_window = assoc.options.get("jump_window_seconds", assoc.options.get("jump_time", 0.0))
-                jump_sustain = assoc.options.get("jump_sustain_frames", assoc.options.get("jump_sustain", 0))
                 bin_indices = assoc.bin_indices or assoc.options.get("bin_indices")
                 if not bin_indices and assoc.bin_index is not None:
                     bin_indices = [assoc.bin_index]
@@ -2223,10 +2400,38 @@ class TimedActionTool(tk.Tk):
                     label = ", ".join(labels)
                 else:
                     label = assoc.track_name or self._frequency_bin_label(assoc.bin_index or 0)
-                summary = (
-                    f"{label}, opacity {opacity}, gap {gap}, color {color}, fade {fade_frames}f, "
-                    f"jump {jump_threshold}%/{jump_window}s x{jump_sustain}f"
-                )
+                opacity = assoc.options.get("opacity", 1.0)
+                if assoc.mode == "waves":
+                    future_steps = assoc.options.get("future_steps", 20)
+                    horizon = assoc.options.get("horizon_percent", 0.5)
+                    color = assoc.options.get("color", "80,180,255")
+                    crash_method = assoc.options.get("crash_method", "vanish")
+                    summary = (
+                        f"{label}, opacity {opacity}, steps {future_steps}, horizon {horizon}, color {color}, crash {crash_method}"
+                    )
+                elif assoc.mode == "rain":
+                    base_density = assoc.options.get("base_density", 0.0)
+                    multiplier = assoc.options.get("density_multiplier", 1.0)
+                    transit_min = assoc.options.get("rain_transit_min", 1)
+                    transit_max = assoc.options.get("rain_transit_max", 1)
+                    drop_size = assoc.options.get("drop_size", 1.0)
+                    drop_variance = assoc.options.get("drop_variance", 1.0)
+                    color = assoc.options.get("color", "140,200,255")
+                    summary = (
+                        f"{label}, opacity {opacity}, base {base_density}, x{multiplier}, speed {transit_min}-{transit_max}f, "
+                        f"size {drop_size}±{drop_variance}x, color {color}"
+                    )
+                else:
+                    gap = assoc.options.get("gap", 3)
+                    color = assoc.options.get("color", "0,255,0")
+                    fade_frames = assoc.options.get("fade_frames", 8)
+                    jump_threshold = assoc.options.get("jump_threshold_percent", assoc.options.get("jump_percent", 0.0))
+                    jump_window = assoc.options.get("jump_window_seconds", assoc.options.get("jump_time", 0.0))
+                    jump_sustain = assoc.options.get("jump_sustain_frames", assoc.options.get("jump_sustain", 0))
+                    summary = (
+                        f"{label}, opacity {opacity}, gap {gap}, color {color}, fade {fade_frames}f, "
+                        f"jump {jump_threshold}%/{jump_window}s x{jump_sustain}f"
+                    )
             elif assoc.mode == "fireworks":
                 summary = (
                     f"Lead {assoc.options.get('pre_launch_frames', 12)}f, "
@@ -2313,6 +2518,7 @@ class TimedActionTool(tk.Tk):
             options=dict(assoc.options),
             source=assoc.source,
             bin_index=assoc.bin_index,
+            bin_indices=list(assoc.bin_indices) if assoc.bin_indices else None,
         )
         self.associations.insert(idx + 1, duplicate)
         self._refresh_assoc_tree()
@@ -2420,6 +2626,15 @@ class TimedActionTool(tk.Tk):
                     bin_indices = [bin_index]
                 if assoc.mode == "waves":
                     effect: VisualEffect = FrequencyWavesEffect(
+                        freq_doc=self.frequency_doc,
+                        bin_indices=list(bin_indices),
+                        duration=duration,
+                        canvas_size=(render_settings.width, render_settings.height),
+                        fps=render_settings.fps,
+                        options=assoc.options,
+                    )
+                elif assoc.mode == "rain":
+                    effect = FrequencyRainEffect(
                         freq_doc=self.frequency_doc,
                         bin_indices=list(bin_indices),
                         duration=duration,

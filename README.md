@@ -178,6 +178,8 @@ Pick an audio file, load a timing JSON, then associate any track with one of the
   intensity and fade time respectively.
 - **Sprite pop** — lets you pick an image plus scale/zoom/hold settings.  Sprites pop into existence slightly before
   the event, hover for the configured hang time, then tumble down the screen under gravity.
+- **Wall** — calculates brick sizes to fill the frame when every trigger adds a brick, stacking offset rows with
+  configurable brick and edge colours.
 
 You can add multiple associations (even reusing the same track in different modes), control their order, and render a
 full video with audio via `imageio`/FFmpeg.  The tool keeps a temporary MP4 for quick previews (Play button) and

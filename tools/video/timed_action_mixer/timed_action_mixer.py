@@ -643,7 +643,78 @@ class PlantEffect(VisualEffect):
         if self.plant_type == "grass":
             self._draw_grass(draw, growth)
         else:
-            self._draw_mushroom(draw, growth)
+        self._draw_mushroom(draw, growth)
+
+
+class WallEffect(VisualEffect):
+    def __init__(
+        self,
+        events: Iterable[TimingEvent],
+        duration: float,
+        canvas_size: tuple[int, int],
+        options: Dict[str, Any],
+    ) -> None:
+        super().__init__(0.0, duration)
+        self.events = sorted(events, key=lambda e: e.time)
+        self.width, self.height = canvas_size
+        self.aspect_ratio = max(1.2, float(options.get("aspect_ratio", 2.0)))
+        self.edge_thickness = max(0, int(options.get("edge_thickness", 2)))
+        self.brick_color = self._parse_color(options.get("brick_color", "186,84,60"))
+        self.edge_color = self._parse_color(options.get("edge_color", "80,40,28"))
+        self.bricks: list[tuple[float, float, float, float, float]] = []
+        self._plan_wall()
+
+    def _parse_color(self, value: Any) -> tuple[int, int, int, int]:
+        if isinstance(value, str):
+            parts = value.replace(";", ",").split(",")
+            if len(parts) >= 3:
+                try:
+                    return tuple(
+                        max(0, min(255, int(float(part.strip())))) for part in parts[:3]
+                    ) + (255,)
+                except Exception:
+                    pass
+        if isinstance(value, (list, tuple)) and len(value) >= 3:
+            try:
+                return tuple(max(0, min(255, int(v))) for v in value[:3]) + (255,)
+            except Exception:
+                pass
+        return 186, 84, 60, 255
+
+    def _plan_wall(self) -> None:
+        total = len(self.events)
+        if total == 0:
+            return
+        ratio = self.aspect_ratio
+        columns_guess = max(1, int(math.ceil(math.sqrt(total * (self.width / max(1.0, self.height)) / ratio))))
+        rows = max(1, int(math.ceil(total / columns_guess)))
+        brick_height = self.height / rows
+        brick_width = ratio * brick_height
+        columns = max(columns_guess, int(math.ceil(self.width / brick_width)) + 2)
+        rows = max(1, int(math.ceil(total / columns)))
+        brick_height = self.height / rows
+        brick_width = ratio * brick_height
+        start_x = -brick_width
+        for idx, event in enumerate(self.events):
+            row = idx // columns
+            col = idx % columns
+            x_offset = (brick_width / 2.0) if row % 2 else 0.0
+            x0 = start_x + col * brick_width + x_offset
+            x1 = x0 + brick_width
+            y1 = self.height - row * brick_height
+            y0 = y1 - brick_height
+            self.bricks.append((x0, y0, x1, y1, float(event.time)))
+
+    def draw(self, image: Image.Image, time_s: float) -> None:  # pragma: no cover - visual output
+        if not self.bricks:
+            return
+        draw = ImageDraw.Draw(image, "RGBA")
+        for x0, y0, x1, y1, event_time in self.bricks:
+            if time_s < event_time:
+                continue
+            draw.rectangle((x0, y0, x1, y1), fill=self.brick_color)
+            if self.edge_thickness > 0:
+                draw.rectangle((x0, y0, x1, y1), outline=self.edge_color, width=self.edge_thickness)
 
 
 class ZigZagEffect(VisualEffect):
@@ -1099,7 +1170,7 @@ class AssociationDialog(simpledialog.Dialog):
         self.mode_var = tk.StringVar(value=(self.config.mode if self.config else "fireworks"))
         self.mode_combo = ttk.Combobox(
             master,
-            values=["fireworks", "sprite_pop", "pop", "plant", "zigzag"],
+            values=["fireworks", "sprite_pop", "pop", "plant", "wall", "zigzag"],
             textvariable=self.mode_var,
             state="readonly",
         )
@@ -1170,6 +1241,17 @@ class AssociationDialog(simpledialog.Dialog):
             if self.config and self.config.mode == "plant":
                 value = self.config.options.get(key, default)
             self.plant_vars[key] = tk.StringVar(value=str(value))
+        wall_defaults = {
+            "brick_color": "186,84,60",
+            "edge_color": "80,40,28",
+            "edge_thickness": 2,
+        }
+        self.wall_vars: dict[str, tk.StringVar] = {}
+        for key, default in wall_defaults.items():
+            value = default
+            if self.config and self.config.mode == "wall":
+                value = self.config.options.get(key, default)
+            self.wall_vars[key] = tk.StringVar(value=str(value))
         zigzag_defaults = {
             "line_width": 2,
             "line_width_variance": 0,
@@ -1276,6 +1358,14 @@ class AssociationDialog(simpledialog.Dialog):
                 state="readonly",
                 width=12,
             ).grid(row=8, column=1, sticky="w")
+        elif mode == "wall":
+            ttk.Label(self.options_frame, text="Wall options:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", columnspan=2)
+            ttk.Label(self.options_frame, text="Brick color (R,G,B):").grid(row=1, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.wall_vars["brick_color"], width=14).grid(row=1, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Edge color (R,G,B):").grid(row=2, column=0, sticky="w", pady=(6, 0))
+            ttk.Entry(self.options_frame, textvariable=self.wall_vars["edge_color"], width=14).grid(row=2, column=1, sticky="w", pady=(6, 0))
+            ttk.Label(self.options_frame, text="Edge thickness (px):").grid(row=3, column=0, sticky="w", pady=(6, 0))
+            ttk.Entry(self.options_frame, textvariable=self.wall_vars["edge_thickness"], width=10).grid(row=3, column=1, sticky="w", pady=(6, 0))
         else:
             ttk.Label(self.options_frame, text="Zigzag options:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", columnspan=2)
             ttk.Label(self.options_frame, text="Line width:").grid(row=1, column=0, sticky="w")
@@ -1353,6 +1443,12 @@ class AssociationDialog(simpledialog.Dialog):
                 "left_margin": float(self.plant_vars["left_margin"].get() or 0.1),
                 "right_margin": float(self.plant_vars["right_margin"].get() or 0.1),
                 "plant_type": self.plant_vars["plant_type"].get() or "random",
+            }
+        elif mode == "wall":
+            options = {
+                "brick_color": self.wall_vars["brick_color"].get() or "186,84,60",
+                "edge_color": self.wall_vars["edge_color"].get() or "80,40,28",
+                "edge_thickness": int(self.wall_vars["edge_thickness"].get() or 2),
             }
         else:
             options = {
@@ -2359,6 +2455,17 @@ class TimedActionTool(tk.Tk):
                     assoc.options,
                     rng,
                 )
+            if assoc.mode == "wall":
+                effect = WallEffect(
+                    events=track.events,
+                    duration=duration,
+                    canvas_size=(render_settings.width, render_settings.height),
+                    options=assoc.options,
+                )
+                effects.append(effect)
+                max_end_time = max(max_end_time, effect.end_time)
+                associations.append(AssociationPlan(config=assoc, effects=effects))
+                continue
             for event in event_iterable:
                 if assoc.mode == "fireworks":
                     effects.append(

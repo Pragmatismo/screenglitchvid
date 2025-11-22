@@ -982,6 +982,226 @@ class ZigZagEffect(VisualEffect):
             draw.line(line["points"], fill=color, width=int(line["width"]))
 
 
+class ConveyorBuildEffect(VisualEffect):
+    def __init__(
+        self,
+        events: list[TimingEvent],
+        duration: float,
+        canvas_size: tuple[int, int],
+        options: Dict[str, Any],
+        rng: random.Random,
+        sprite_root: Optional[Path] = None,
+    ) -> None:
+        end_time = duration + float(options.get("bar_length", 1200.0)) / max(
+            1.0, float(options.get("bar_speed", 180.0))
+        )
+        super().__init__(0.0, end_time)
+        self.events = sorted(events, key=lambda e: e.time)
+        self.width, self.height = canvas_size
+        self.rng = rng
+        self.bar_speed = max(1.0, float(options.get("bar_speed", 180.0)))
+        self.bar_length = max(10.0, float(options.get("bar_length", 1200.0)))
+        self.horizon_percent = max(0.05, min(0.95, float(options.get("horizon_percent", 0.22))))
+        self.origin_percent = max(0.1, min(0.98, float(options.get("origin_percent", 0.82))))
+        self.active_zone = max(5.0, float(options.get("active_zone_length", 420.0)))
+        self.spawn_depth = max(0.0, float(options.get("spawn_depth", 0.0)))
+        self.show_bar = bool(options.get("show_bar", True))
+        self.bar_width_near = max(2.0, float(options.get("bar_width_near", 80.0)))
+        self.bar_width_far = max(1.0, float(options.get("bar_width_far", 12.0)))
+        self.bar_color = self._parse_color(options.get("bar_color", "200,200,210"))
+        self.small_dir = self._resolve_dir(options.get("small_dir"), sprite_root, "small")
+        self.mid_dir = self._resolve_dir(options.get("mid_dir"), sprite_root, "mid")
+        self.large_dir = self._resolve_dir(options.get("large_dir"), sprite_root, "large")
+        self.level_scales = (
+            max(0.05, float(options.get("scale_small", 1.0))),
+            max(0.05, float(options.get("scale_mid", 2.0))),
+            max(0.05, float(options.get("scale_large", 4.0))),
+        )
+        self.thresholds = (
+            max(1, int(options.get("threshold_small", 1))),
+            max(1, int(options.get("threshold_mid", 3))),
+            max(1, int(options.get("threshold_large", 6))),
+        )
+        self._sprite_cache: dict[str, list[Image.Image]] = {}
+        self.attachments: list[dict[str, Any]] = []
+        self._next_id = 1
+        self._event_idx = 0
+        self._last_update_time = 0.0
+        self.side_state: dict[str, dict[str, Any]] = {
+            "left": {"counter": 0, "active_id": None},
+            "top": {"counter": 0, "active_id": None},
+            "right": {"counter": 0, "active_id": None},
+        }
+
+    def _parse_color(self, value: Any) -> tuple[int, int, int, int]:
+        try:
+            if isinstance(value, (list, tuple)) and len(value) >= 3:
+                r, g, b = value[:3]
+            else:
+                parts = str(value).split(",")
+                r, g, b = (int(float(parts[i])) for i in range(3))
+            r = max(0, min(255, int(r)))
+            g = max(0, min(255, int(g)))
+            b = max(0, min(255, int(b)))
+        except Exception:
+            r, g, b = 200, 200, 210
+        return (r, g, b, 255)
+
+    def _resolve_dir(self, path_value: Any, sprite_root: Optional[Path], fallback: str) -> Path:
+        if path_value:
+            path = Path(str(path_value)).expanduser()
+            return path
+        base = sprite_root or Path.cwd()
+        return base / fallback
+
+    def _load_sprites(self, directory: Path) -> list[Image.Image]:
+        cache_key = str(directory.expanduser().resolve())
+        if cache_key in self._sprite_cache:
+            return self._sprite_cache[cache_key]
+        sprites: list[Image.Image] = []
+        if directory.exists():
+            for path in sorted(directory.iterdir()):
+                if path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+                    continue
+                try:
+                    sprites.append(Image.open(path).convert("RGBA"))
+                except Exception:
+                    continue
+        if not sprites:
+            placeholder = Image.new("RGBA", (96, 96), (255, 140, 140, 255))
+            draw = ImageDraw.Draw(placeholder)
+            draw.rectangle((10, 10, 86, 86), outline=(0, 0, 0, 255), width=4)
+            draw.line((10, 48, 86, 48), fill=(0, 0, 0, 255), width=4)
+            sprites.append(placeholder)
+        self._sprite_cache[cache_key] = sprites
+        return sprites
+
+    def _random_sprite(self, level: int, side: str) -> Image.Image:
+        level_idx = max(1, min(3, level))
+        directory = [self.small_dir, self.mid_dir, self.large_dir][level_idx - 1]
+        candidates = self._load_sprites(directory)
+        base = self.rng.choice(candidates)
+        if side == "right":
+            base = base.transpose(Image.FLIP_LEFT_RIGHT)
+        elif side == "top":
+            base = base.rotate(90, expand=True)
+        return base
+
+    def _add_attachment(self, side: str, level: int, z: float) -> int:
+        sprite = self._random_sprite(level, side)
+        attachment = {
+            "id": self._next_id,
+            "side": side,
+            "level": level,
+            "z": z,
+            "sprite": sprite,
+            "size": sprite.size,
+        }
+        self._next_id += 1
+        self.attachments.append(attachment)
+        return attachment["id"]
+
+    def _find_attachment(self, attachment_id: Optional[int]) -> Optional[dict[str, Any]]:
+        if attachment_id is None:
+            return None
+        for att in self.attachments:
+            if att.get("id") == attachment_id:
+                return att
+        return None
+
+    def _perspective_at(self, z: float) -> tuple[float, float, float]:
+        progress = max(0.0, min(1.0, z / self.bar_length))
+        origin_y = self.height * self.origin_percent
+        horizon_y = self.height * self.horizon_percent
+        y = origin_y + (horizon_y - origin_y) * progress
+        scale = max(0.05, 1.0 - 0.75 * progress)
+        bar_width = self.bar_width_near + (self.bar_width_far - self.bar_width_near) * progress
+        return y, scale, bar_width
+
+    def _move_attachments(self, delta: float) -> None:
+        if delta <= 0:
+            return
+        for att in self.attachments:
+            att["z"] += self.bar_speed * delta
+        self.attachments = [att for att in self.attachments if att["z"] <= self.bar_length]
+        for side, state in self.side_state.items():
+            att = self._find_attachment(state.get("active_id"))
+            if att is None or att["z"] > self.active_zone:
+                state["active_id"] = None
+                state["counter"] = 0
+
+    def _handle_event(self, event: TimingEvent) -> None:
+        side = self.rng.choice(["left", "top", "right"])
+        state = self.side_state[side]
+        att = self._find_attachment(state.get("active_id"))
+        if att is None or att["z"] > self.active_zone:
+            new_id = self._add_attachment(side, 1, max(0.0, self.spawn_depth))
+            state["active_id"] = new_id
+            state["counter"] = 1
+            return
+
+        state["counter"] += 1
+        threshold_idx = min(att["level"] - 1, 2)
+        threshold = self.thresholds[threshold_idx]
+        if state["counter"] > threshold and att["level"] < 3:
+            att["level"] += 1
+            att["sprite"] = self._random_sprite(att["level"], side)
+            att["size"] = att["sprite"].size
+            state["counter"] = 0
+
+    def _advance(self, target_time: float) -> None:
+        if target_time < self._last_update_time:
+            self._last_update_time = target_time
+        while self._event_idx < len(self.events) and self.events[self._event_idx].time <= target_time:
+            event_time = max(self._last_update_time, self.events[self._event_idx].time)
+            self._move_attachments(event_time - self._last_update_time)
+            self._last_update_time = event_time
+            self._handle_event(self.events[self._event_idx])
+            self._event_idx += 1
+        self._move_attachments(target_time - self._last_update_time)
+        self._last_update_time = target_time
+
+    def _draw_bar(self, draw: ImageDraw.ImageDraw) -> None:
+        if not self.show_bar:
+            return
+        origin_y = self.height * self.origin_percent
+        horizon_y = self.height * self.horizon_percent
+        near_half = self.bar_width_near / 2.0
+        far_half = self.bar_width_far / 2.0
+        center_x = self.width / 2.0
+        points = [
+            (center_x - near_half, origin_y),
+            (center_x + near_half, origin_y),
+            (center_x + far_half, horizon_y),
+            (center_x - far_half, horizon_y),
+        ]
+        draw.polygon(points, fill=self.bar_color)
+
+    def _draw_attachment(self, image: Image.Image, att: dict[str, Any]) -> None:
+        y, scale, _bar_width = self._perspective_at(att["z"])
+        level_idx = max(1, min(3, att["level"]))
+        level_scale = self.level_scales[level_idx - 1]
+        sprite = att["sprite"]
+        w = max(1, int(sprite.size[0] * scale * level_scale))
+        h = max(1, int(sprite.size[1] * scale * level_scale))
+        sprite_img = sprite.resize((w, h), RESAMPLE)
+        center_x = self.width / 2.0
+        if att["side"] == "left":
+            top_left = (int(center_x), int(y - h / 2))
+        elif att["side"] == "right":
+            top_left = (int(center_x - w), int(y - h / 2))
+        else:
+            top_left = (int(center_x - w / 2), int(y - h))
+        image.paste(sprite_img, box=top_left, mask=sprite_img)
+
+    def draw(self, image: Image.Image, time_s: float) -> None:  # pragma: no cover - visual output
+        self._advance(time_s)
+        draw = ImageDraw.Draw(image)
+        self._draw_bar(draw)
+        for att in sorted(self.attachments, key=lambda entry: entry["z"], reverse=True):
+            self._draw_attachment(image, att)
+
+
 class FrequencyEQEffect(VisualEffect):
     def __init__(
         self,
@@ -1420,10 +1640,12 @@ class AssociationDialog(simpledialog.Dialog):
         tracks: Iterable[str],
         config: Optional[AssociationConfig] = None,
         selected_track: Optional[str] = None,
+        default_sprite_root: Optional[Path] = None,
     ):
         self.track_names = list(tracks)
         self.config = config
         self.selected_track = selected_track
+        self.default_sprite_root = default_sprite_root
         self.result_config: Optional[AssociationConfig] = None
         super().__init__(parent, title="Configure timed action")
 
@@ -1445,7 +1667,7 @@ class AssociationDialog(simpledialog.Dialog):
         self.mode_var = tk.StringVar(value=(self.config.mode if self.config else "fireworks"))
         self.mode_combo = ttk.Combobox(
             master,
-            values=["fireworks", "sprite_pop", "pop", "splash", "plant", "wall", "zigzag"],
+            values=["fireworks", "sprite_pop", "pop", "splash", "plant", "wall", "zigzag", "conveyor_bar"],
             textvariable=self.mode_var,
             state="readonly",
         )
@@ -1562,6 +1784,37 @@ class AssociationDialog(simpledialog.Dialog):
             if self.config and self.config.mode == "zigzag":
                 value = self.config.options.get(key, default)
             self.zigzag_vars[key] = tk.StringVar(value=str(value))
+        sprite_root = self.default_sprite_root
+        conveyor_defaults = {
+            "small_dir": str((sprite_root / "small") if sprite_root else ""),
+            "mid_dir": str((sprite_root / "mid") if sprite_root else ""),
+            "large_dir": str((sprite_root / "large") if sprite_root else ""),
+            "scale_small": 1.0,
+            "scale_mid": 2.0,
+            "scale_large": 4.0,
+            "threshold_small": 1,
+            "threshold_mid": 3,
+            "threshold_large": 6,
+            "bar_speed": 180.0,
+            "bar_length": 1200.0,
+            "horizon_percent": 0.22,
+            "origin_percent": 0.82,
+            "active_zone_length": 420.0,
+            "spawn_depth": 0.0,
+            "show_bar": True,
+            "bar_width_near": 80.0,
+            "bar_width_far": 12.0,
+            "bar_color": "200,200,210",
+        }
+        self.conveyor_vars: dict[str, tk.Variable] = {}
+        for key, default in conveyor_defaults.items():
+            value = default
+            if self.config and self.config.mode == "conveyor_bar":
+                value = self.config.options.get(key, default)
+            if key == "show_bar":
+                self.conveyor_vars[key] = tk.BooleanVar(value=bool(value))
+            else:
+                self.conveyor_vars[key] = tk.StringVar(value=str(value))
 
     def _show_mode_options(self) -> None:
         for child in self.options_frame.winfo_children():
@@ -1681,6 +1934,44 @@ class AssociationDialog(simpledialog.Dialog):
             ttk.Entry(self.options_frame, textvariable=self.wall_vars["edge_color"], width=14).grid(row=2, column=1, sticky="w", pady=(6, 0))
             ttk.Label(self.options_frame, text="Edge thickness (px):").grid(row=3, column=0, sticky="w", pady=(6, 0))
             ttk.Entry(self.options_frame, textvariable=self.wall_vars["edge_thickness"], width=10).grid(row=3, column=1, sticky="w", pady=(6, 0))
+        elif mode == "conveyor_bar":
+            ttk.Label(self.options_frame, text="Conveyor build options:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", columnspan=3)
+            ttk.Label(self.options_frame, text="Small sprites:").grid(row=1, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.conveyor_vars["small_dir"], width=32).grid(row=1, column=1, sticky="ew")
+            ttk.Button(self.options_frame, text="Browse", command=lambda: self._browse_directory(self.conveyor_vars["small_dir"])).grid(row=1, column=2, padx=(6, 0))
+            ttk.Label(self.options_frame, text="Mid sprites:").grid(row=2, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.conveyor_vars["mid_dir"], width=32).grid(row=2, column=1, sticky="ew")
+            ttk.Button(self.options_frame, text="Browse", command=lambda: self._browse_directory(self.conveyor_vars["mid_dir"])).grid(row=2, column=2, padx=(6, 0))
+            ttk.Label(self.options_frame, text="Large sprites:").grid(row=3, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.conveyor_vars["large_dir"], width=32).grid(row=3, column=1, sticky="ew")
+            ttk.Button(self.options_frame, text="Browse", command=lambda: self._browse_directory(self.conveyor_vars["large_dir"])).grid(row=3, column=2, padx=(6, 0))
+            ttk.Label(self.options_frame, text="Scale (small/mid/large):").grid(row=4, column=0, sticky="w", pady=(6, 0))
+            ttk.Entry(self.options_frame, textvariable=self.conveyor_vars["scale_small"], width=8).grid(row=4, column=1, sticky="w", pady=(6, 0))
+            ttk.Entry(self.options_frame, textvariable=self.conveyor_vars["scale_mid"], width=8).grid(row=4, column=1, sticky="", padx=(70, 0), pady=(6, 0))
+            ttk.Entry(self.options_frame, textvariable=self.conveyor_vars["scale_large"], width=8).grid(row=4, column=1, sticky="e", pady=(6, 0))
+            ttk.Label(self.options_frame, text="Upgrade thresholds:").grid(row=5, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.conveyor_vars["threshold_small"], width=8).grid(row=5, column=1, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.conveyor_vars["threshold_mid"], width=8).grid(row=5, column=1, sticky="", padx=(70, 0))
+            ttk.Entry(self.options_frame, textvariable=self.conveyor_vars["threshold_large"], width=8).grid(row=5, column=1, sticky="e")
+            ttk.Label(self.options_frame, text="Bar speed (units/s):").grid(row=6, column=0, sticky="w", pady=(6, 0))
+            ttk.Entry(self.options_frame, textvariable=self.conveyor_vars["bar_speed"], width=12).grid(row=6, column=1, sticky="w", pady=(6, 0))
+            ttk.Label(self.options_frame, text="Bar length (units):").grid(row=7, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.conveyor_vars["bar_length"], width=12).grid(row=7, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Horizon percent:").grid(row=8, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.conveyor_vars["horizon_percent"], width=12).grid(row=8, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Origin percent:").grid(row=9, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.conveyor_vars["origin_percent"], width=12).grid(row=9, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Active zone length:").grid(row=10, column=0, sticky="w", pady=(6, 0))
+            ttk.Entry(self.options_frame, textvariable=self.conveyor_vars["active_zone_length"], width=12).grid(row=10, column=1, sticky="w", pady=(6, 0))
+            ttk.Label(self.options_frame, text="Spawn depth:").grid(row=11, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.conveyor_vars["spawn_depth"], width=12).grid(row=11, column=1, sticky="w")
+            ttk.Checkbutton(self.options_frame, text="Show bar", variable=self.conveyor_vars["show_bar"], onvalue=True, offvalue=False).grid(row=12, column=0, sticky="w", pady=(6, 0))
+            ttk.Label(self.options_frame, text="Bar width (near/far):").grid(row=13, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.conveyor_vars["bar_width_near"], width=10).grid(row=13, column=1, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.conveyor_vars["bar_width_far"], width=10).grid(row=13, column=1, sticky="e")
+            ttk.Label(self.options_frame, text="Bar color (R,G,B):").grid(row=14, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.conveyor_vars["bar_color"], width=14).grid(row=14, column=1, sticky="w")
+            self.options_frame.columnconfigure(1, weight=1)
         else:
             ttk.Label(self.options_frame, text="Zigzag options:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", columnspan=2)
             ttk.Label(self.options_frame, text="Line width:").grid(row=1, column=0, sticky="w")
@@ -1713,6 +2004,12 @@ class AssociationDialog(simpledialog.Dialog):
         file_path = filedialog.askopenfilename(title="Select sprite", initialdir=str(initial.parent if initial.exists() else Path.cwd()), filetypes=(("Images", "*.png;*.jpg;*.jpeg"), ("All", "*.*")))
         if file_path:
             self.sprite_vars["sprite_path"].set(file_path)
+
+    def _browse_directory(self, var: tk.Variable) -> None:
+        initial = Path(str(var.get() or "")).expanduser()
+        directory = filedialog.askdirectory(title="Select sprite folder", initialdir=str(initial if initial.exists() else Path.cwd()))
+        if directory:
+            var.set(directory)
 
     def validate(self) -> bool:
         if not self.track_var.get():
@@ -1777,6 +2074,28 @@ class AssociationDialog(simpledialog.Dialog):
                 "brick_color": self.wall_vars["brick_color"].get() or "186,84,60",
                 "edge_color": self.wall_vars["edge_color"].get() or "80,40,28",
                 "edge_thickness": int(self.wall_vars["edge_thickness"].get() or 2),
+            }
+        elif mode == "conveyor_bar":
+            options = {
+                "small_dir": self.conveyor_vars["small_dir"].get(),
+                "mid_dir": self.conveyor_vars["mid_dir"].get(),
+                "large_dir": self.conveyor_vars["large_dir"].get(),
+                "scale_small": float(self.conveyor_vars["scale_small"].get() or 1.0),
+                "scale_mid": float(self.conveyor_vars["scale_mid"].get() or 2.0),
+                "scale_large": float(self.conveyor_vars["scale_large"].get() or 4.0),
+                "threshold_small": int(self.conveyor_vars["threshold_small"].get() or 1),
+                "threshold_mid": int(self.conveyor_vars["threshold_mid"].get() or 3),
+                "threshold_large": int(self.conveyor_vars["threshold_large"].get() or 6),
+                "bar_speed": float(self.conveyor_vars["bar_speed"].get() or 180.0),
+                "bar_length": float(self.conveyor_vars["bar_length"].get() or 1200.0),
+                "horizon_percent": float(self.conveyor_vars["horizon_percent"].get() or 0.22),
+                "origin_percent": float(self.conveyor_vars["origin_percent"].get() or 0.82),
+                "active_zone_length": float(self.conveyor_vars["active_zone_length"].get() or 420.0),
+                "spawn_depth": float(self.conveyor_vars["spawn_depth"].get() or 0.0),
+                "show_bar": bool(self.conveyor_vars["show_bar"].get()),
+                "bar_width_near": float(self.conveyor_vars["bar_width_near"].get() or 80.0),
+                "bar_width_far": float(self.conveyor_vars["bar_width_far"].get() or 12.0),
+                "bar_color": self.conveyor_vars["bar_color"].get() or "200,200,210",
             }
         else:
             options = {
@@ -2266,6 +2585,11 @@ class TimedActionTool(tk.Tk):
         return self.repo_root / "assets" / "timed_action_mixer"
 
     # ------------------------------------------------------------------
+    def _default_sprite_root(self) -> Path:
+        base = self.project_root or self.repo_root
+        return base / "internal" / "timed_action_mixer" / "sprites"
+
+    # ------------------------------------------------------------------
     def _render_suffix(self, codec: str) -> str:
         lookup = {
             "libx264": "mp4",
@@ -2577,6 +2901,7 @@ class TimedActionTool(tk.Tk):
             self,
             self.timing_doc.tracks.keys(),
             selected_track=track_name,
+            default_sprite_root=self._default_sprite_root(),
         )
         if dialog.result_config:
             self.associations.append(dialog.result_config)
@@ -2678,6 +3003,27 @@ class TimedActionTool(tk.Tk):
                     f"height {assoc.options.get('plant_height', 120.0)}, "
                     f"type {assoc.options.get('plant_type', 'random')}"
                 )
+            elif assoc.mode == "conveyor_bar":
+                speed = assoc.options.get("bar_speed", 180.0)
+                length = assoc.options.get("bar_length", 1200.0)
+                active = assoc.options.get("active_zone_length", 420.0)
+                scales = (
+                    assoc.options.get("scale_small", 1.0),
+                    assoc.options.get("scale_mid", 2.0),
+                    assoc.options.get("scale_large", 4.0),
+                )
+                thresholds = (
+                    assoc.options.get("threshold_small", 1),
+                    assoc.options.get("threshold_mid", 3),
+                    assoc.options.get("threshold_large", 6),
+                )
+                show_bar = assoc.options.get("show_bar", True)
+                summary = (
+                    f"Speed {speed}u/s, length {length}, active {active}, "
+                    f"scales {scales[0]}/{scales[1]}/{scales[2]}, "
+                    f"thresholds {thresholds[0]}/{thresholds[1]}/{thresholds[2]}, "
+                    f"bar {'on' if show_bar else 'off'}"
+                )
             else:
                 summary = (
                     f"Lines {assoc.options.get('amount', 1)}, "
@@ -2716,6 +3062,7 @@ class TimedActionTool(tk.Tk):
                 self,
                 self.timing_doc.tracks.keys() if self.timing_doc else [],
                 assoc,
+                default_sprite_root=self._default_sprite_root(),
             )
         if dialog.result_config:
             self.associations[idx] = dialog.result_config
@@ -2892,6 +3239,19 @@ class TimedActionTool(tk.Tk):
                     duration=duration,
                     canvas_size=(render_settings.width, render_settings.height),
                     options=assoc.options,
+                )
+                effects.append(effect)
+                max_end_time = max(max_end_time, effect.end_time)
+                associations.append(AssociationPlan(config=assoc, effects=effects))
+                continue
+            if assoc.mode == "conveyor_bar":
+                effect = ConveyorBuildEffect(
+                    events=track.events,
+                    duration=duration,
+                    canvas_size=(render_settings.width, render_settings.height),
+                    options=assoc.options,
+                    rng=rng,
+                    sprite_root=self._default_sprite_root(),
                 )
                 effects.append(effect)
                 max_end_time = max(max_end_time, effect.end_time)

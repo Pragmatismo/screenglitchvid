@@ -770,6 +770,7 @@ class AudioMapTool:
         self._play_sound: Optional[Any] = None
         self._play_channel: Optional[Any] = None
         self._pygame: Optional[Any] = None
+        self._frequency_display_max = 100.0
         self._freq_timing_settings: Dict[str, object] = {
             "track_name": "frequency_triggers",
             "bin_index": 0,
@@ -842,6 +843,21 @@ class AudioMapTool:
         self.freq_bar_container = ttk.Frame(sidebar)
         self.freq_bar_container.pack(fill="x", pady=(4, 0))
         self.freq_bar_widgets: List[ttk.Progressbar] = []
+        gain_frame = ttk.Frame(sidebar)
+        gain_frame.pack(fill="x", pady=(4, 0))
+        ttk.Label(gain_frame, text="Gain").pack(side=tk.LEFT)
+        self.freq_gain_var = tk.DoubleVar(value=1.0)
+        self.freq_gain_label = ttk.Label(gain_frame, text="1.0x")
+        self.freq_gain_label.pack(side=tk.RIGHT)
+        gain_slider = ttk.Scale(
+            gain_frame,
+            from_=0.2,
+            to=5.0,
+            orient="horizontal",
+            variable=self.freq_gain_var,
+            command=self._on_freq_gain_change,
+        )
+        gain_slider.pack(fill="x", expand=True, padx=(6, 6))
         self.freq_status_var = tk.StringVar(value="Frequency data not loaded.")
         ttk.Label(sidebar, textvariable=self.freq_status_var, wraplength=180, justify="left").pack(fill="x", pady=(4, 0))
 
@@ -1072,6 +1088,15 @@ class AudioMapTool:
         self._analysis_thread.start()
 
     def _analysis_done(self, doc: TimingDocument, freq_doc: Optional[FrequencyDocument]) -> None:
+        previous_doc = self.doc
+        if previous_doc:
+            merged_tracks: "OrderedDict[str, TimingTrack]" = OrderedDict()
+            for name, track in doc.tracks.items():
+                merged_tracks[name] = track
+            for name, track in previous_doc.tracks.items():
+                if name not in merged_tracks:
+                    merged_tracks[name] = track
+            doc.tracks = merged_tracks
         self.doc = doc
         self.freq_doc = freq_doc
         self.timeline.set_tracks(doc.tracks)
@@ -1479,7 +1504,7 @@ class AudioMapTool:
                 orient="vertical",
                 length=160,
                 mode="determinate",
-                maximum=100,
+                maximum=self._frequency_display_max,
             )
             bar.pack(fill="y")
             ttk.Label(
@@ -1492,6 +1517,17 @@ class AudioMapTool:
         self.freq_status_var.set(
             f"{freq_doc.bin_count} bins • {freq_doc.capture_rate:.1f} samples/s"
         )
+        self._on_freq_gain_change()
+
+    def _apply_frequency_gain(self, level: float) -> float:
+        gain = self.freq_gain_var.get() if hasattr(self, "freq_gain_var") else 1.0
+        boosted = level * gain
+        return max(0.0, min(self._frequency_display_max, boosted))
+
+    def _on_freq_gain_change(self, _value: str | None = None) -> None:
+        if hasattr(self, "freq_gain_label"):
+            self.freq_gain_label.config(text=f"{self.freq_gain_var.get():.1f}x")
+        self._update_frequency_display()
 
     def _update_frequency_display(self, timestamp: Optional[float] = None) -> None:
         if not hasattr(self, "freq_bar_widgets"):
@@ -1502,7 +1538,7 @@ class AudioMapTool:
             timestamp = self.timeline.current_playhead_time if hasattr(self, "timeline") else 0.0
         levels = self.freq_doc.levels_at(timestamp)
         for bar, level in zip(self.freq_bar_widgets, levels):
-            bar["value"] = max(0.0, min(100.0, level))
+            bar["value"] = self._apply_frequency_gain(level)
 
     def _update_frequency_button_state(self) -> None:
         if not hasattr(self, "frequency_btn"):
@@ -1869,11 +1905,12 @@ class AudioMapTool:
         frames = self.freq_doc.frames
         if not frames:
             return []
-        prev_level = frames[0].levels[bin_index] if bin_index < len(frames[0].levels) else 0.0
+        prev_level_raw = frames[0].levels[bin_index] if bin_index < len(frames[0].levels) else 0.0
+        prev_level = self._apply_frequency_gain(prev_level_raw)
         for frame in frames[1:]:
             if bin_index >= len(frame.levels):
                 continue
-            level = frame.levels[bin_index]
+            level = self._apply_frequency_gain(frame.levels[bin_index])
             if abs(level - prev_level) >= sensitivity:
                 start, end = self.freq_doc.bin_edges[bin_index]
                 events.append(

@@ -541,6 +541,91 @@ class PopEffect(VisualEffect):
         self._draw_shards(draw)
 
 
+class WarbleRingEffect(VisualEffect):
+    def __init__(
+        self,
+        event: TimingEvent,
+        fps: int,
+        canvas_size: tuple[int, int],
+        rng: random.Random,
+        options: Dict[str, Any],
+    ) -> None:
+        width, height = canvas_size
+        duration = float(event.duration) if event.duration is not None else float(options.get("duration", 1.0))
+        duration = max(0.1, duration)
+        start = float(event.time)
+        end = start + duration
+        super().__init__(start, end)
+        self.center = (rng.uniform(width * 0.2, width * 0.8), rng.uniform(height * 0.2, height * 0.8))
+        radius_percent = max(0.05, min(0.9, float(options.get("radius_percent", 0.35))))
+        self.base_radius = min(width, height) * radius_percent
+        self.amplitude = max(0.0, float(options.get("amplitude", 16.0)))
+        self.nodes = max(1, int(options.get("nodes", 8)))
+        self.period = max(0.05, float(options.get("period", 1.25)))
+        self.thickness = max(1, int(options.get("thickness", 6)))
+        self.ring_count = max(1, int(options.get("ring_count", 1)))
+        self.final_radius_factor = max(0.05, float(options.get("final_radius_factor", 1.0)))
+        self.opacity = max(0.0, min(1.0, float(options.get("opacity", 1.0))))
+        self.final_opacity = max(0.0, min(1.0, float(options.get("final_opacity", 0.4))))
+        self.color = self._parse_color(options.get("color", "random"), rng)
+
+        self.phase_offset = rng.uniform(0, math.tau)
+
+    def _parse_color(self, value: Any, rng: random.Random) -> tuple[int, int, int]:
+        if isinstance(value, str) and value.lower() == "random":
+            return tuple(rng.randint(40, 255) for _ in range(3))
+        try:
+            if isinstance(value, (list, tuple)) and len(value) >= 3:
+                r, g, b = value[:3]
+            else:
+                parts = str(value).replace(";", ",").split(",")
+                r, g, b = (int(float(parts[i])) for i in range(3))
+            r = max(0, min(255, int(r)))
+            g = max(0, min(255, int(g)))
+            b = max(0, min(255, int(b)))
+            return (r, g, b)
+        except Exception:
+            return tuple(rng.randint(40, 255) for _ in range(3))
+
+    def _ring_radii(self) -> list[float]:
+        if self.ring_count == 1:
+            return [self.base_radius]
+        final_radius = self.base_radius * self.final_radius_factor
+        step = (final_radius - self.base_radius) / max(self.ring_count - 1, 1)
+        return [self.base_radius + step * idx for idx in range(self.ring_count)]
+
+    def _alpha_for_ring(self, ring_index: int) -> int:
+        if self.ring_count == 1:
+            alpha = int(255 * self.opacity)
+        else:
+            start_alpha = int(255 * self.opacity)
+            end_alpha = int(255 * self.final_opacity)
+            alpha = start_alpha + (end_alpha - start_alpha) * ring_index / max(self.ring_count - 1, 1)
+        return max(0, min(255, int(alpha)))
+
+    def draw(self, image: Image.Image, time_s: float) -> None:  # pragma: no cover - visual output
+        if time_s < self.start_time or time_s > self.end_time:
+            return
+        draw = ImageDraw.Draw(image, "RGBA")
+        elapsed = time_s - self.start_time
+        phase = self.phase_offset + (elapsed / self.period) * math.tau
+        for idx, radius in enumerate(self._ring_radii()):
+            points: list[tuple[float, float]] = []
+            alpha = self._alpha_for_ring(idx)
+            color = self.color + (alpha,)
+            ripple_phase = math.sin(phase) if self.nodes == 1 else 0.0
+            for step in range(180):
+                angle = (step / 180.0) * math.tau
+                ripple = self.amplitude * (ripple_phase if self.nodes == 1 else math.sin(self.nodes * angle + phase))
+                ripple_radius = max(1.0, radius + ripple)
+                x = self.center[0] + ripple_radius * math.cos(angle)
+                y = self.center[1] + ripple_radius * math.sin(angle)
+                points.append((x, y))
+            if len(points) > 1:
+                points.append(points[0])
+                draw.line(points, fill=color, width=self.thickness, joint="curve")
+
+
 class SplashEffect(VisualEffect):
     def __init__(
         self,
@@ -1689,7 +1774,7 @@ class AssociationDialog(simpledialog.Dialog):
         self.mode_var = tk.StringVar(value=(self.config.mode if self.config else "fireworks"))
         self.mode_combo = ttk.Combobox(
             master,
-            values=["fireworks", "sprite_pop", "pop", "splash", "plant", "wall", "zigzag", "conveyor_bar"],
+            values=["fireworks", "sprite_pop", "pop", "splash", "warble_ring", "plant", "wall", "zigzag", "conveyor_bar"],
             textvariable=self.mode_var,
             state="readonly",
         )
@@ -1742,6 +1827,25 @@ class AssociationDialog(simpledialog.Dialog):
             if self.config and self.config.mode == "pop":
                 value = self.config.options.get(key, default)
             self.pop_vars[key] = tk.StringVar(value=str(value))
+        warble_defaults = {
+            "duration": 1.0,
+            "amplitude": 16.0,
+            "nodes": 6,
+            "period": 1.25,
+            "thickness": 6,
+            "ring_count": 1,
+            "final_radius_factor": 1.0,
+            "final_opacity": 0.4,
+            "opacity": 1.0,
+            "radius_percent": 0.35,
+            "color": "random",
+        }
+        self.warble_vars: dict[str, tk.StringVar] = {}
+        for key, default in warble_defaults.items():
+            value = default
+            if self.config and self.config.mode == "warble_ring":
+                value = self.config.options.get(key, default)
+            self.warble_vars[key] = tk.StringVar(value=str(value))
         splash_defaults = {
             "start_size": 28.0,
             "impact_size": 10.0,
@@ -1918,6 +2022,30 @@ class AssociationDialog(simpledialog.Dialog):
             ttk.Entry(self.options_frame, textvariable=self.splash_vars["burst_distance"], width=12).grid(row=9, column=1, sticky="w")
             ttk.Label(self.options_frame, text="Distance randomness (0-1):").grid(row=10, column=0, sticky="w")
             ttk.Entry(self.options_frame, textvariable=self.splash_vars["burst_distance_variance"], width=12).grid(row=10, column=1, sticky="w")
+        elif mode == "warble_ring":
+            ttk.Label(self.options_frame, text="Warble ring options:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", columnspan=2)
+            ttk.Label(self.options_frame, text="Duration (s):").grid(row=1, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.warble_vars["duration"], width=12).grid(row=1, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Amplitude (px):").grid(row=2, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.warble_vars["amplitude"], width=12).grid(row=2, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Nodes around ring:").grid(row=3, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.warble_vars["nodes"], width=12).grid(row=3, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Period (s):").grid(row=4, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.warble_vars["period"], width=12).grid(row=4, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Ring thickness (px):").grid(row=5, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.warble_vars["thickness"], width=12).grid(row=5, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Concentric rings:").grid(row=6, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.warble_vars["ring_count"], width=12).grid(row=6, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Final ring factor:").grid(row=7, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.warble_vars["final_radius_factor"], width=12).grid(row=7, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Final ring opacity (0-1):").grid(row=8, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.warble_vars["final_opacity"], width=12).grid(row=8, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Base opacity (0-1):").grid(row=9, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.warble_vars["opacity"], width=12).grid(row=9, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Radius percent of frame:").grid(row=10, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.warble_vars["radius_percent"], width=12).grid(row=10, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Ring color (R,G,B or random):").grid(row=11, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.warble_vars["color"], width=18).grid(row=11, column=1, sticky="w")
         elif mode == "plant":
             ttk.Label(self.options_frame, text="Plant options:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", columnspan=2)
             ttk.Label(self.options_frame, text="Seed lead time (frames):").grid(row=1, column=0, sticky="w")
@@ -2090,6 +2218,20 @@ class AssociationDialog(simpledialog.Dialog):
                 "left_margin": float(self.plant_vars["left_margin"].get() or 0.1),
                 "right_margin": float(self.plant_vars["right_margin"].get() or 0.1),
                 "plant_type": self.plant_vars["plant_type"].get() or "random",
+            }
+        elif mode == "warble_ring":
+            options = {
+                "duration": float(self.warble_vars["duration"].get() or 1.0),
+                "amplitude": float(self.warble_vars["amplitude"].get() or 16.0),
+                "nodes": int(self.warble_vars["nodes"].get() or 6),
+                "period": float(self.warble_vars["period"].get() or 1.25),
+                "thickness": int(self.warble_vars["thickness"].get() or 6),
+                "ring_count": int(self.warble_vars["ring_count"].get() or 1),
+                "final_radius_factor": float(self.warble_vars["final_radius_factor"].get() or 1.0),
+                "final_opacity": float(self.warble_vars["final_opacity"].get() or 0.4),
+                "opacity": float(self.warble_vars["opacity"].get() or 1.0),
+                "radius_percent": float(self.warble_vars["radius_percent"].get() or 0.35),
+                "color": self.warble_vars["color"].get() or "random",
             }
         elif mode == "wall":
             options = {
@@ -3083,6 +3225,13 @@ class TimedActionTool(tk.Tk):
                     f"burst {assoc.options.get('burst_count', 14)}±{assoc.options.get('burst_count_variance', 0.25)}, "
                     f"range {assoc.options.get('burst_distance', 140.0)}±{assoc.options.get('burst_distance_variance', 0.35)}"
                 )
+            elif assoc.mode == "warble_ring":
+                summary = (
+                    f"Duration {assoc.options.get('duration', 'auto')}s, "
+                    f"nodes {assoc.options.get('nodes', 6)}, amp {assoc.options.get('amplitude', 16.0)}, "
+                    f"period {assoc.options.get('period', 1.25)}s, rings {assoc.options.get('ring_count', 1)}, "
+                    f"final x{assoc.options.get('final_radius_factor', 1.0)}, opacity {assoc.options.get('opacity', 1.0)}→{assoc.options.get('final_opacity', 0.4)}"
+                )
             elif assoc.mode == "plant":
                 summary = (
                     f"Seed lead {assoc.options.get('seed_lead_frames', 10)}f, "
@@ -3380,6 +3529,16 @@ class TimedActionTool(tk.Tk):
                 elif assoc.mode == "splash":
                     effects.append(
                         SplashEffect(
+                            event=event,
+                            fps=render_settings.fps,
+                            canvas_size=(render_settings.width, render_settings.height),
+                            rng=rng,
+                            options=assoc.options,
+                        )
+                    )
+                elif assoc.mode == "warble_ring":
+                    effects.append(
+                        WarbleRingEffect(
                             event=event,
                             fps=render_settings.fps,
                             canvas_size=(render_settings.width, render_settings.height),

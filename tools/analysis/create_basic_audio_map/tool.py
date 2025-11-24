@@ -1848,12 +1848,46 @@ class AudioMapTool:
             bin_combo.current(default_bin)
         bin_combo.grid(row=1, column=1, padx=6, pady=4)
 
-        ttk.Label(dialog, text="Sensitivity (percentage change)").grid(row=2, column=0, sticky="w", padx=6, pady=4)
+        ttk.Label(dialog, text="Detection mode").grid(row=2, column=0, sticky="w", padx=6, pady=4)
+        detection_mode_var = tk.StringVar(value=str(self._freq_timing_settings.get("detection_mode", "change")))
+        detection_mode_combo = ttk.Combobox(
+            dialog,
+            values=["change", "above"],
+            state="readonly",
+            textvariable=detection_mode_var,
+            width=28,
+        )
+        detection_mode_combo.grid(row=2, column=1, padx=6, pady=4)
+
+        sensitivity_row = ttk.Frame(dialog)
+        ttk.Label(sensitivity_row, text="Sensitivity (percentage change)").grid(row=0, column=0, sticky="w", padx=6, pady=4)
         sensitivity_var = tk.StringVar(value=str(self._freq_timing_settings.get("sensitivity", 10.0)))
-        ttk.Entry(dialog, textvariable=sensitivity_var).grid(row=2, column=1, padx=6, pady=4)
+        ttk.Entry(sensitivity_row, textvariable=sensitivity_var).grid(row=0, column=1, padx=6, pady=4)
+        sensitivity_row.grid(row=3, column=0, columnspan=2)
+
+        threshold_row = ttk.Frame(dialog)
+        ttk.Label(threshold_row, text="Threshold (% of max)").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        threshold_var = tk.StringVar(value=str(self._freq_timing_settings.get("threshold", 50.0)))
+        ttk.Entry(threshold_row, textvariable=threshold_var).grid(row=0, column=1, padx=6, pady=4)
+        ttk.Label(threshold_row, text="Frames below threshold required").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        frames_under_var = tk.StringVar(value=str(self._freq_timing_settings.get("frames_under", 1)))
+        ttk.Entry(threshold_row, textvariable=frames_under_var).grid(row=1, column=1, padx=6, pady=4)
+        threshold_row.grid(row=3, column=0, columnspan=2)
+
+        def _update_mode_fields(_event: tk.Event | None = None) -> None:
+            mode = detection_mode_var.get()
+            if mode == "above":
+                sensitivity_row.grid_remove()
+                threshold_row.grid()
+            else:
+                threshold_row.grid_remove()
+                sensitivity_row.grid()
+
+        detection_mode_combo.bind("<<ComboboxSelected>>", _update_mode_fields)
+        _update_mode_fields()
 
         button_frame = ttk.Frame(dialog)
-        button_frame.grid(row=3, column=0, columnspan=2, pady=(6, 8))
+        button_frame.grid(row=4, column=0, columnspan=2, pady=(6, 8))
 
         def on_ok() -> None:
             track_name = track_var.get().strip() or f"frequency_bin_{default_bin + 1}"
@@ -1863,14 +1897,46 @@ class AudioMapTool:
             selected_index = bin_combo.current()
             if selected_index < 0:
                 selected_index = 0
-            try:
-                sensitivity = max(0.0, float(sensitivity_var.get()))
-            except ValueError:
-                messagebox.showerror("Invalid sensitivity", "Sensitivity must be numeric.", parent=dialog)
-                return
-            events = self._build_frequency_events(selected_index, sensitivity)
+            mode = detection_mode_var.get() or "change"
+            threshold_value: float = float(self._freq_timing_settings.get("threshold", 50.0))
+            frames_under_value: int = int(self._freq_timing_settings.get("frames_under", 1))
+            if mode == "above":
+                try:
+                    threshold_value = max(0.0, float(threshold_var.get()))
+                except ValueError:
+                    messagebox.showerror("Invalid threshold", "Threshold must be numeric.", parent=dialog)
+                    return
+                try:
+                    frames_under_value = max(1, int(frames_under_var.get()))
+                except ValueError:
+                    messagebox.showerror(
+                        "Invalid frame gap",
+                        "Frames below threshold must be an integer.",
+                        parent=dialog,
+                    )
+                    return
+                events = self._build_frequency_events(
+                    bin_index=selected_index,
+                    detection_mode=mode,
+                    sensitivity=0.0,
+                    threshold=threshold_value,
+                    frames_under=frames_under_value,
+                )
+            else:
+                try:
+                    sensitivity = max(0.0, float(sensitivity_var.get()))
+                except ValueError:
+                    messagebox.showerror("Invalid sensitivity", "Sensitivity must be numeric.", parent=dialog)
+                    return
+                events = self._build_frequency_events(
+                    bin_index=selected_index,
+                    detection_mode="change",
+                    sensitivity=sensitivity,
+                    threshold=0.0,
+                    frames_under=1,
+                )
             if not events:
-                messagebox.showinfo("No events", "No changes exceeded the selected sensitivity.", parent=dialog)
+                messagebox.showinfo("No events", "No changes exceeded the selected settings.", parent=dialog)
                 return
             track = self.doc.tracks.get(track_name)
             if track and track.events:
@@ -1886,7 +1952,10 @@ class AudioMapTool:
             self._freq_timing_settings = {
                 "track_name": track_name,
                 "bin_index": selected_index,
-                "sensitivity": sensitivity,
+                "sensitivity": sensitivity if mode == "change" else self._freq_timing_settings.get("sensitivity", 10.0),
+                "detection_mode": mode,
+                "threshold": threshold_value if mode == "above" else self._freq_timing_settings.get("threshold", 50.0),
+                "frames_under": frames_under_value if mode == "above" else self._freq_timing_settings.get("frames_under", 1),
             }
             start, end = self.freq_doc.bin_edges[selected_index]
             self.status_var.set(
@@ -1898,34 +1967,110 @@ class AudioMapTool:
         ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=6)
         dialog.wait_window()
 
-    def _build_frequency_events(self, bin_index: int, sensitivity: float) -> List[TimingEvent]:
+    def _build_frequency_events(
+        self,
+        bin_index: int,
+        detection_mode: str,
+        sensitivity: float,
+        threshold: float,
+        frames_under: int,
+    ) -> List[TimingEvent]:
         if not self.freq_doc or not self.freq_doc.frames:
             return []
         events: List[TimingEvent] = []
         frames = self.freq_doc.frames
         if not frames:
             return []
+        frame_interval = 0.0
+        if self.freq_doc.capture_rate and self.freq_doc.capture_rate > 0:
+            frame_interval = 1.0 / float(self.freq_doc.capture_rate)
+        elif len(frames) >= 2:
+            frame_interval = max(0.0, float(frames[1].time) - float(frames[0].time))
         prev_level_raw = frames[0].levels[bin_index] if bin_index < len(frames[0].levels) else 0.0
         prev_level = self._apply_frequency_gain(prev_level_raw)
-        for frame in frames[1:]:
-            if bin_index >= len(frame.levels):
-                continue
-            level = self._apply_frequency_gain(frame.levels[bin_index])
-            if abs(level - prev_level) >= sensitivity:
+        if detection_mode == "above":
+            active = False
+            start_time = 0.0
+            last_above_time = 0.0
+            over_values: List[float] = []
+            below_count = 0
+            for frame in frames:
+                if bin_index >= len(frame.levels):
+                    continue
+                level = self._apply_frequency_gain(frame.levels[bin_index])
+                over_amount = level - threshold
+                if over_amount > 0:
+                    if not active:
+                        active = True
+                        start_time = float(frame.time)
+                        over_values = []
+                    over_values.append(float(over_amount))
+                    last_above_time = float(frame.time)
+                    below_count = 0
+                elif active:
+                    below_count += 1
+                    if below_count >= frames_under:
+                        duration = max(frame_interval, (last_above_time - start_time) + frame_interval)
+                        average_over = float(sum(over_values) / len(over_values)) if over_values else 0.0
+                        start, end = self.freq_doc.bin_edges[bin_index]
+                        events.append(
+                            TimingEvent(
+                                time=float(start_time),
+                                value=average_over,
+                                label="frequency_trigger",
+                                duration=float(duration),
+                                data={
+                                    "bin": bin_index,
+                                    "range": [float(start), float(end)],
+                                    "threshold": float(threshold),
+                                    "mode": "above",
+                                    "average_over": average_over,
+                                },
+                            )
+                        )
+                        active = False
+                        over_values = []
+                prev_level = level
+            if active:
+                duration = max(frame_interval, (last_above_time - start_time) + frame_interval)
+                average_over = float(sum(over_values) / len(over_values)) if over_values else 0.0
                 start, end = self.freq_doc.bin_edges[bin_index]
                 events.append(
                     TimingEvent(
-                        time=float(frame.time),
-                        value=float(level),
+                        time=float(start_time),
+                        value=average_over,
                         label="frequency_trigger",
+                        duration=float(duration),
                         data={
                             "bin": bin_index,
                             "range": [float(start), float(end)],
-                            "change": float(level - prev_level),
+                            "threshold": float(threshold),
+                            "mode": "above",
+                            "average_over": average_over,
                         },
                     )
                 )
-            prev_level = level
+        else:
+            for frame in frames[1:]:
+                if bin_index >= len(frame.levels):
+                    continue
+                level = self._apply_frequency_gain(frame.levels[bin_index])
+                if abs(level - prev_level) >= sensitivity:
+                    start, end = self.freq_doc.bin_edges[bin_index]
+                    events.append(
+                        TimingEvent(
+                            time=float(frame.time),
+                            value=float(level),
+                            label="frequency_trigger",
+                            data={
+                                "bin": bin_index,
+                                "range": [float(start), float(end)],
+                                "change": float(level - prev_level),
+                                "mode": "change",
+                            },
+                        )
+                    )
+                prev_level = level
         return events
 
 

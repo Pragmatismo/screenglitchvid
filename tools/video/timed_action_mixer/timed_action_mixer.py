@@ -553,9 +553,12 @@ class WarbleRingEffect(VisualEffect):
         width, height = canvas_size
         duration = float(event.duration) if event.duration is not None else float(options.get("duration", 1.0))
         duration = max(0.1, duration)
+        fade_frames = max(0, int(options.get("fade_frames", 0)))
+        self.fade_duration = fade_frames / float(max(1, fps))
         start = float(event.time)
-        end = start + duration
+        end = start + duration + self.fade_duration
         super().__init__(start, end)
+        self.main_duration = duration
         self.center = (rng.uniform(width * 0.2, width * 0.8), rng.uniform(height * 0.2, height * 0.8))
         radius_percent = max(0.05, min(0.9, float(options.get("radius_percent", 0.35))))
         self.base_radius = min(width, height) * radius_percent
@@ -609,9 +612,13 @@ class WarbleRingEffect(VisualEffect):
         draw = ImageDraw.Draw(image, "RGBA")
         elapsed = time_s - self.start_time
         phase = self.phase_offset + (elapsed / self.period) * math.tau
+        fade_factor = 1.0
+        if self.fade_duration > 0 and elapsed > self.main_duration:
+            fade_progress = min(1.0, max(0.0, (elapsed - self.main_duration) / self.fade_duration))
+            fade_factor = 1.0 - fade_progress
         for idx, radius in enumerate(self._ring_radii()):
             points: list[tuple[float, float]] = []
-            alpha = self._alpha_for_ring(idx)
+            alpha = int(self._alpha_for_ring(idx) * fade_factor)
             color = self.color + (alpha,)
             ripple_phase = math.sin(phase) if self.nodes == 1 else 0.0
             for step in range(180):
@@ -1838,6 +1845,7 @@ class AssociationDialog(simpledialog.Dialog):
             "final_opacity": 0.4,
             "opacity": 1.0,
             "radius_percent": 0.35,
+            "fade_frames": 0,
             "color": "random",
         }
         self.warble_vars: dict[str, tk.StringVar] = {}
@@ -2044,8 +2052,10 @@ class AssociationDialog(simpledialog.Dialog):
             ttk.Entry(self.options_frame, textvariable=self.warble_vars["opacity"], width=12).grid(row=9, column=1, sticky="w")
             ttk.Label(self.options_frame, text="Radius percent of frame:").grid(row=10, column=0, sticky="w")
             ttk.Entry(self.options_frame, textvariable=self.warble_vars["radius_percent"], width=12).grid(row=10, column=1, sticky="w")
-            ttk.Label(self.options_frame, text="Ring color (R,G,B or random):").grid(row=11, column=0, sticky="w")
-            ttk.Entry(self.options_frame, textvariable=self.warble_vars["color"], width=18).grid(row=11, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Fade-out frames:").grid(row=11, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.warble_vars["fade_frames"], width=12).grid(row=11, column=1, sticky="w")
+            ttk.Label(self.options_frame, text="Ring color (R,G,B or random):").grid(row=12, column=0, sticky="w")
+            ttk.Entry(self.options_frame, textvariable=self.warble_vars["color"], width=18).grid(row=12, column=1, sticky="w")
         elif mode == "plant":
             ttk.Label(self.options_frame, text="Plant options:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", columnspan=2)
             ttk.Label(self.options_frame, text="Seed lead time (frames):").grid(row=1, column=0, sticky="w")
@@ -2231,6 +2241,7 @@ class AssociationDialog(simpledialog.Dialog):
                 "final_opacity": float(self.warble_vars["final_opacity"].get() or 0.4),
                 "opacity": float(self.warble_vars["opacity"].get() or 1.0),
                 "radius_percent": float(self.warble_vars["radius_percent"].get() or 0.35),
+                "fade_frames": int(self.warble_vars["fade_frames"].get() or 0),
                 "color": self.warble_vars["color"].get() or "random",
             }
         elif mode == "wall":

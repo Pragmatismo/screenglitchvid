@@ -54,6 +54,8 @@ class RenderSettings:
     fps: int = DEFAULT_FPS
     codec: str = DEFAULT_CODEC
     background: str = "black"
+    start_frame: Optional[int] = None
+    end_frame: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1346,13 +1348,33 @@ class RenderPlan:
     background: tuple[int, int, int, int]
     use_alpha: bool
     associations: List[AssociationPlan]
+    start_frame: Optional[int] = None
+    end_frame: Optional[int] = None
+
+    @property
+    def base_total_frames(self) -> int:
+        return int(math.ceil(self.duration * self.fps))
+
+    @property
+    def start_frame_index(self) -> int:
+        base = max(0, self.base_total_frames - 1)
+        if self.start_frame is None:
+            return 0
+        return min(max(0, int(self.start_frame) - 1), base)
+
+    @property
+    def end_frame_index(self) -> int:
+        base = max(0, self.base_total_frames - 1)
+        if self.end_frame is None:
+            return max(self.start_frame_index, base)
+        return max(self.start_frame_index, min(base, int(self.end_frame) - 1))
 
     @property
     def total_frames(self) -> int:
-        return int(math.ceil(self.duration * self.fps))
+        return max(0, self.end_frame_index - self.start_frame_index + 1)
 
     def frame_time(self, frame_idx: int) -> float:
-        return frame_idx / self.fps
+        return (self.start_frame_index + frame_idx) / self.fps
 
     def generate_frame(self, frame_idx: int) -> np.ndarray:  # pragma: no cover - visual output
         time_s = self.frame_time(frame_idx)
@@ -2476,6 +2498,15 @@ class RenderSettingsDialog(simpledialog.Dialog):
         self.background_entry.grid(row=6, column=1, sticky="w")
         ttk.Button(master, text="Pick", command=self._pick_color).grid(row=6, column=2, sticky="e")
 
+        ttk.Label(master, text="First frame:").grid(row=7, column=0, sticky="w", pady=(8, 0))
+        self.start_frame_var = tk.StringVar(value=str(self.settings.start_frame or ""))
+        ttk.Entry(master, textvariable=self.start_frame_var, width=10).grid(row=7, column=1, sticky="w", pady=(8, 0))
+
+        ttk.Label(master, text="Last frame:").grid(row=8, column=0, sticky="w")
+        self.end_frame_var = tk.StringVar(value=str(self.settings.end_frame or ""))
+        ttk.Entry(master, textvariable=self.end_frame_var, width=10).grid(row=8, column=1, sticky="w")
+        ttk.Button(master, text="Reset to full", command=self._reset_frame_window).grid(row=8, column=2, sticky="e")
+
         master.columnconfigure(1, weight=1)
         self._update_background_state()
         return width_entry
@@ -2510,11 +2541,22 @@ class RenderSettingsDialog(simpledialog.Dialog):
             width = int(self.width_var.get())
             height = int(self.height_var.get())
             fps = int(self.fps_var.get())
+            start_frame = self._parse_frame_input(self.start_frame_var.get())
+            end_frame = self._parse_frame_input(self.end_frame_var.get())
         except ValueError:
             messagebox.showerror("Render settings", "Width, height, and FPS must be numbers.", parent=self)
             return False
         if width <= 0 or height <= 0 or fps <= 0:
             messagebox.showerror("Render settings", "Width, height, and FPS must be positive.", parent=self)
+            return False
+        if start_frame is not None and start_frame <= 0:
+            messagebox.showerror("Render settings", "First frame must be at least 1.", parent=self)
+            return False
+        if end_frame is not None and end_frame <= 0:
+            messagebox.showerror("Render settings", "Last frame must be at least 1.", parent=self)
+            return False
+        if start_frame is not None and end_frame is not None and end_frame < start_frame:
+            messagebox.showerror("Render settings", "Last frame must be greater than or equal to the first frame.", parent=self)
             return False
         return True
 
@@ -2528,7 +2570,21 @@ class RenderSettingsDialog(simpledialog.Dialog):
             fps=int(self.fps_var.get()),
             codec=codec,
             background=background,
+            start_frame=self._parse_frame_input(self.start_frame_var.get()),
+            end_frame=self._parse_frame_input(self.end_frame_var.get()),
         )
+
+    def _parse_frame_input(self, value: str) -> Optional[int]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        return int(text)
+
+    def _reset_frame_window(self) -> None:
+        self.start_frame_var.set("")
+        self.end_frame_var.set("")
 
 
 class TimedActionTool(tk.Tk):
@@ -2620,7 +2676,26 @@ class TimedActionTool(tk.Tk):
         fps = int(payload.get("fps", DEFAULT_FPS) or DEFAULT_FPS)
         codec = str(payload.get("codec", DEFAULT_CODEC) or DEFAULT_CODEC)
         background = str(payload.get("background", "black") or "black")
-        return RenderSettings(width=width, height=height, fps=fps, codec=codec, background=background)
+        start_frame = self._parse_optional_frame(payload.get("start_frame"))
+        end_frame = self._parse_optional_frame(payload.get("end_frame"))
+        return RenderSettings(
+            width=width,
+            height=height,
+            fps=fps,
+            codec=codec,
+            background=background,
+            start_frame=start_frame,
+            end_frame=end_frame,
+        )
+
+    def _parse_optional_frame(self, value: Any) -> Optional[int]:
+        try:
+            frame = int(value)
+        except Exception:
+            return None
+        if frame <= 0:
+            return None
+        return frame
 
     # ------------------------------------------------------------------
     def _save_render_settings(self) -> None:
@@ -2638,7 +2713,19 @@ class TimedActionTool(tk.Tk):
         fps = max(1, int(settings.fps or DEFAULT_FPS))
         codec = settings.codec or DEFAULT_CODEC
         background = settings.background or "black"
-        self.render_settings = RenderSettings(width=width, height=height, fps=fps, codec=codec, background=background)
+        start_frame = settings.start_frame if settings.start_frame is None else max(1, int(settings.start_frame))
+        end_frame = settings.end_frame if settings.end_frame is None else max(1, int(settings.end_frame))
+        if start_frame is not None and end_frame is not None and end_frame < start_frame:
+            end_frame = start_frame
+        self.render_settings = RenderSettings(
+            width=width,
+            height=height,
+            fps=fps,
+            codec=codec,
+            background=background,
+            start_frame=start_frame,
+            end_frame=end_frame,
+        )
         self._save_render_settings()
         return self.render_settings
 
@@ -3346,6 +3433,8 @@ class TimedActionTool(tk.Tk):
             background=background,
             use_alpha=use_alpha,
             associations=associations,
+            start_frame=render_settings.start_frame,
+            end_frame=render_settings.end_frame,
         )
 
     # ------------------------------------------------------------------
@@ -3408,13 +3497,19 @@ class TimedActionTool(tk.Tk):
             self._set_status_async(f"Unable to start writer: {exc}")
             return
 
+        if plan.total_frames <= 0:
+            writer.close()
+            self._set_status_async("Nothing to render for the selected frame range.")
+            return
+
         try:
-            for frame_idx in range(plan.total_frames):
-                frame = plan.generate_frame(frame_idx)
+            for relative_idx in range(plan.total_frames):
+                frame_idx = plan.start_frame_index + relative_idx
+                frame = plan.generate_frame(relative_idx)
                 writer.append_data(frame)
-                if frame_idx % 30 == 0:
+                if relative_idx % 30 == 0:
                     self._set_status_async(
-                        f"Rendering frame {frame_idx + 1}/{plan.total_frames}"
+                        f"Rendering frame {frame_idx + 1}/{plan.base_total_frames}"
                     )
         finally:
             writer.close()

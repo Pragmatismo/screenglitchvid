@@ -6,6 +6,7 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
+from urllib.parse import unquote, urlparse
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -161,7 +162,31 @@ class ParallaxPlaygroundApp(BaseTkClass):
         if not paths:
             return
         for raw in paths:
-            self._add_image(Path(raw))
+            path = self._normalize_path(raw)
+            if path:
+                self._add_image(path)
+
+    # ------------------------------------------------------------------
+    def _normalize_path(self, raw: str) -> Optional[Path]:
+        """Convert drag-and-drop payloads into usable file paths.
+
+        Some Linux desktops (e.g., Linux Mint with tkdnd) deliver file URIs
+        like ``file:///home/user/image.png`` instead of plain paths, and these
+        fail the ``Path.exists`` check.  Normalising here keeps drop support
+        consistent across platforms.
+        """
+
+        if not raw:
+            return None
+
+        raw = raw.strip()
+        if raw.startswith("file://"):
+            parsed = urlparse(raw)
+            if parsed.scheme == "file" and parsed.path:
+                return Path(unquote(parsed.path))
+            return None
+
+        return Path(raw)
 
     # ------------------------------------------------------------------
     def _open_file_dialog(self) -> None:  # pragma: no cover - UI callback

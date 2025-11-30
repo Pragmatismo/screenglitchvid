@@ -53,11 +53,10 @@ class ToolLauncherFrame(ttk.Frame):
     # ------------------------------------------------------------------
     def _build(self) -> None:
         self.columnconfigure(1, weight=1)
-        button_label = self.tool_info.get("button_label", f"Launch {self.tool_info['name']}")
         self.button_image = self.app.get_tool_button_image(self.tool_info)
         self.launch_btn = ttk.Button(
             self,
-            text=button_label,
+            text="",
             image=self.button_image,
             compound="center",
             command=self.launch_tool,
@@ -89,15 +88,16 @@ class ToolLauncherFrame(ttk.Frame):
         )
 
         if self.tool_info.get("requires_config", False):
-            config_frame = ttk.Frame(info)
-            config_frame.grid(row=4, column=0, sticky="ew", pady=(4, 0))
-            config_frame.columnconfigure(1, weight=1)
-            ttk.Label(config_frame, text="Config file:").grid(row=0, column=0, sticky="w")
-            self.config_entry = ttk.Entry(config_frame, textvariable=self.config_path, width=50)
+            self.config_frame = ttk.Frame(info)
+            self.config_frame.grid(row=4, column=0, sticky="ew", pady=(4, 0))
+            self.config_frame.columnconfigure(1, weight=1)
+            ttk.Label(self.config_frame, text="Config file:").grid(row=0, column=0, sticky="w")
+            self.config_entry = ttk.Entry(self.config_frame, textvariable=self.config_path, width=50)
             self.config_entry.grid(row=0, column=1, sticky="ew", padx=(6, 6))
-            self.browse_btn = ttk.Button(config_frame, text="Browse", command=self.browse_config)
+            self.browse_btn = ttk.Button(self.config_frame, text="Browse", command=self.browse_config)
             self.browse_btn.grid(row=0, column=2, sticky="e")
         else:
+            self.config_frame = None
             self.config_entry = None
             self.browse_btn = None
 
@@ -131,6 +131,11 @@ class ToolLauncherFrame(ttk.Frame):
                 state = "normal"
             self.config_entry.configure(state=state)
             self.browse_btn.configure(state=state)
+            if self.config_frame:
+                if use_project:
+                    self.config_frame.grid_remove()
+                else:
+                    self.config_frame.grid()
 
         if use_project:
             self.status_var.set("Using selected project context")
@@ -352,7 +357,7 @@ class ToolboxApp(tk.Tk):
                 "key": "audio_map",
                 "name": "Create Basic Audio Map",
                 "button_label": "Launch audio map tool",
-                "description": "Load a song and build tempo/timing markers (placeholder UI).",
+                "description": "Load a song and build tempo/timing markers.",
                 "script": self.repo_root / "tools/analysis/create_basic_audio_map/tool.py",
                 "button_image": self.repo_root / "assets/ui/button_images/audio_map.png",
                 "supports_project_settings": True,
@@ -377,6 +382,16 @@ class ToolboxApp(tk.Tk):
                 "project_internal_path": ("video", "hex_glitch"),
                 "project_config_name": "config.json",
                 "uses_output_dir": True,
+            },
+            {
+                "key": "parallax_playground",
+                "name": "Parallax Playground",
+                "button_label": "Launch parallax playground",
+                "description": "Create background scenes with parallax and perspective motion effects.",
+                "script": self.repo_root / "tools/video/parallax_playground/parallax_playground.py",
+                "button_image": self.repo_root / "assets/ui/button_images/paralax.png",
+                "supports_project_settings": True,
+                "requires_config": False,
             },
             {
                 "key": "timed_action_mixer",

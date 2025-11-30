@@ -392,6 +392,7 @@ class ToolboxApp(tk.Tk):
                 "button_image": self.repo_root / "assets/ui/button_images/paralax.png",
                 "supports_project_settings": True,
                 "requires_config": False,
+                "passes_project": True,
             },
             {
                 "key": "timed_action_mixer",

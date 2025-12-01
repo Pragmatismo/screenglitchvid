@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import math
+import random
+import time
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
 from urllib.parse import unquote, urlparse
 
+import imageio.v2 as imageio
+import numpy as np
 import tkinter as tk
+from PIL import Image
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 try:  # Optional drag-and-drop support
@@ -19,6 +26,21 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 ALLOWED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff"}
+
+if hasattr(Image, "Resampling"):
+    RESAMPLE = Image.Resampling.LANCZOS
+else:  # pragma: no cover - Pillow < 9 fallback
+    RESAMPLE = Image.LANCZOS
+
+
+@dataclass
+class ActiveInstance:
+    """State for a single spawned sprite in the animation."""
+
+    item_id: str
+    depth: float
+    x: float
+    lateral_offset: float
 
 
 @dataclass
@@ -77,6 +99,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
         self.foreground_cutoff_var = tk.DoubleVar(value=5.0)
         self.duration_var = tk.StringVar()
         self.render_settings = RenderSettings()
+        self.last_render_path: Optional[Path] = None
 
         self._build_ui()
         self._configure_drop()
@@ -398,12 +421,191 @@ class ParallaxPlaygroundApp(BaseTkClass):
 
     # ------------------------------------------------------------------
     def _render_animation(self) -> None:  # pragma: no cover - UI callback
-        print("not yet coded")
-        messagebox.showinfo("Render animation", "Render animation is not yet coded.", parent=self)
+        items = list(self.items.items())
+        if not items:
+            messagebox.showwarning("Render animation", "Add at least one image before rendering.", parent=self)
+            return
+
+        distance = self._safe_float(self.distance_var)
+        rate = self._safe_float(self.rate_var)
+        horizon_height = self._safe_float(self.horizon_height_var)
+        horizon_distance = self._safe_float(self.distance_to_horizon_var)
+        fog_amount = self._safe_float(self.horizon_fog_var)
+        fog_depth = self._safe_float(self.horizon_fog_depth_var)
+        foreground_cutoff = self._safe_float(self.foreground_cutoff_var)
+
+        if None in {distance, rate, horizon_height, horizon_distance, fog_amount, fog_depth, foreground_cutoff}:
+            messagebox.showerror("Render animation", "Please enter numeric animation settings before rendering.", parent=self)
+            return
+        assert distance is not None and rate is not None
+        assert horizon_height is not None and horizon_distance is not None
+        assert fog_amount is not None and fog_depth is not None and foreground_cutoff is not None
+
+        if rate == 0:
+            messagebox.showerror("Render animation", "Rate of travel must be non-zero.", parent=self)
+            return
+        if horizon_distance <= 0:
+            messagebox.showerror("Render animation", "Distance to horizon must be greater than zero.", parent=self)
+            return
+        if not 0 <= horizon_height <= 1:
+            messagebox.showerror("Render animation", "Horizon height must be between 0 and 1.", parent=self)
+            return
+
+        fps = self.render_settings.fps
+        duration = abs(distance / rate)
+        total_frames = max(1, math.ceil(duration * fps))
+        start_frame = self.render_settings.start_frame or 1
+        end_frame = self.render_settings.end_frame or total_frames
+        end_frame = min(end_frame, total_frames)
+        if start_frame > end_frame:
+            messagebox.showerror("Render animation", "Start frame must be before end frame.", parent=self)
+            return
+
+        horizon_y = self.render_settings.height * horizon_height
+        direction = self.direction_var.get()
+        horizontal_sign = -1 if direction in {"right", "clock-wise"} else 1
+        forward_motion = direction == "up"
+        backward_motion = direction == "down"
+        sideways_motion = direction in {"left", "right"}
+        rotational_motion = direction in {"clock-wise", "counter clock-wise"}
+
+        rng = random.Random()
+        try:
+            loaded_items: Dict[str, tuple[ParallaxItem, Image.Image]] = {
+                iid: (item, Image.open(item.image_path).convert("RGBA")) for iid, item in items
+            }
+        except FileNotFoundError:
+            messagebox.showerror("Render animation", "One or more image paths are missing.", parent=self)
+            return
+        except Exception as exc:  # pragma: no cover - runtime guard for unexpected image errors
+            messagebox.showerror("Render animation", f"Failed to load images: {exc}", parent=self)
+            return
+
+        spawn_budget: Dict[str, float] = defaultdict(float)
+        active: list[ActiveInstance] = []
+        speed = abs(rate)
+        delta_depth = speed / fps
+        delta_time = 1 / fps
+        fog_start = max(0.0, horizon_distance - fog_depth)
+        parallax_margin = 80
+        output_name = f"parallax_render_{int(time.time())}.mp4"
+        output_path = self.project_assets_dir / output_name
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = None
+
+        def project_scale(depth: float) -> float:
+            base = horizon_distance / max(depth, 1e-3) * 0.1
+            return max(0.05, min(base, 6.0))
+
+        def depth_progress(depth: float) -> float:
+            return max(0.0, min(1.0, 1 - depth / (horizon_distance + 1e-3)))
+
+        def fog_multiplier(depth: float) -> float:
+            if depth <= fog_start:
+                return 1.0
+            fog_ratio = min(1.0, (depth - fog_start) / max(fog_depth, 1e-3))
+            return 1.0 - fog_ratio * fog_amount
+
+        def parallax_factor(depth: float) -> float:
+            return 0.6 + (horizon_distance / (depth + 1e-3)) * 0.2
+
+        def spawn_instance(item_id: str) -> None:
+            item, _image = loaded_items[item_id]
+            depth = foreground_cutoff + rng.uniform(max(0.01, item.min_distance), max(0.02, item.max_distance))
+            if forward_motion:
+                x_pos = rng.uniform(0, self.render_settings.width)
+            elif backward_motion:
+                x_pos = rng.uniform(0, self.render_settings.width)
+            elif sideways_motion or rotational_motion:
+                if direction == "right":
+                    x_pos = self.render_settings.width + parallax_margin
+                elif direction == "left":
+                    x_pos = -parallax_margin
+                else:  # rotation
+                    x_pos = rng.uniform(-parallax_margin, self.render_settings.width + parallax_margin)
+            lateral_offset = rng.uniform(-self.render_settings.height * 0.12, self.render_settings.height * 0.12)
+            active.append(ActiveInstance(item_id=item_id, depth=depth, x=x_pos, lateral_offset=lateral_offset))
+
+        for frame_idx in range(total_frames):
+            for iid, (item, _image) in loaded_items.items():
+                spawn_budget[iid] += item.frequency * delta_time
+                while spawn_budget[iid] >= 1:
+                    spawn_instance(iid)
+                    spawn_budget[iid] -= 1
+                if spawn_budget[iid] > 0 and rng.random() < spawn_budget[iid]:
+                    spawn_instance(iid)
+                    spawn_budget[iid] = 0
+
+            updated_active: list[ActiveInstance] = []
+            for instance in active:
+                if forward_motion:
+                    instance.depth -= delta_depth
+                    if instance.depth <= foreground_cutoff:
+                        continue
+                elif backward_motion:
+                    instance.depth += delta_depth
+                    if instance.depth >= horizon_distance + fog_depth:
+                        continue
+                elif sideways_motion:
+                    factor = parallax_factor(instance.depth)
+                    instance.x += horizontal_sign * speed * delta_time * factor
+                    if instance.x < -parallax_margin or instance.x > self.render_settings.width + parallax_margin:
+                        continue
+                elif rotational_motion:
+                    factor = parallax_factor(instance.depth)
+                    instance.x += horizontal_sign * speed * delta_time * factor * 0.6
+                updated_active.append(instance)
+            active = updated_active
+
+            frame = Image.new("RGBA", (self.render_settings.width, self.render_settings.height), "black")
+            draw_list = sorted(active, key=lambda inst: inst.depth, reverse=True)
+            for inst in draw_list:
+                item, image = loaded_items[inst.item_id]
+                scale = project_scale(inst.depth)
+                target_w = int(image.width * scale)
+                target_h = int(image.height * scale)
+                if target_w < 1 or target_h < 1:
+                    continue
+                scaled = image.resize((target_w, target_h), RESAMPLE)
+                depth_factor = depth_progress(inst.depth)
+                y_pos = horizon_y + (self.render_settings.height - horizon_y) * depth_factor + inst.lateral_offset
+                y_pos = max(-target_h, min(self.render_settings.height + target_h, y_pos))
+                alpha = fog_multiplier(inst.depth)
+                if alpha < 1.0:
+                    alpha_layer = scaled.split()[3].point(lambda a: int(a * alpha))
+                    scaled.putalpha(alpha_layer)
+                frame.alpha_composite(
+                    scaled,
+                    (int(inst.x - target_w / 2), int(y_pos - target_h / 2)),
+                )
+
+            if start_frame - 1 <= frame_idx <= end_frame - 1:
+                frame_rgb = frame.convert("RGB")
+                imageio_frame = np.array(frame_rgb)
+                if writer is None:
+                    writer = imageio.get_writer(
+                        output_path,
+                        fps=fps,
+                        codec=self.render_settings.codec,
+                        quality=8,
+                    )
+                writer.append_data(imageio_frame)
+
+        if writer is not None:
+            writer.close()
+        self.last_render_path = output_path
+        messagebox.showinfo("Render animation", f"Saved render to {output_path}", parent=self)
 
     # ------------------------------------------------------------------
     def _play_last_render(self) -> None:  # pragma: no cover - UI callback
-        messagebox.showinfo("Play last render", "Playback not yet available in this tool.", parent=self)
+        if self.last_render_path and self.last_render_path.exists():
+            messagebox.showinfo(
+                "Last render",
+                f"Most recent render saved to:\n{self.last_render_path}",
+                parent=self,
+            )
+        else:
+            messagebox.showinfo("Last render", "No render has been created yet.", parent=self)
 
     # ------------------------------------------------------------------
     def _save_to_assets(self) -> None:  # pragma: no cover - UI callback

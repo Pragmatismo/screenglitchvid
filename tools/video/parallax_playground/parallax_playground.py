@@ -51,13 +51,15 @@ class ParallaxItem:
     min_distance: float = 1.0
     max_distance: float = 5.0
     frequency: float = 1.0
+    scale: float = 1.0
 
-    def as_row(self) -> tuple[str, str, str, str]:
+    def as_row(self) -> tuple[str, str, str, str, str]:
         return (
             str(self.image_path),
             f"{self.min_distance:.2f}",
             f"{self.max_distance:.2f}",
             f"{self.frequency:.2f}",
+            f"{self.scale:.2f}",
         )
 
 
@@ -154,7 +156,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
 
         table_frame = ttk.Frame(container)
         table_frame.pack(fill="both", expand=True)
-        columns = ("image", "min", "max", "frequency")
+        columns = ("image", "min", "max", "frequency", "scale")
         self.tree = ttk.Treeview(
             table_frame,
             columns=columns,
@@ -166,10 +168,12 @@ class ParallaxPlaygroundApp(BaseTkClass):
         self.tree.heading("min", text="Min distance")
         self.tree.heading("max", text="Max distance")
         self.tree.heading("frequency", text="Frequency")
-        self.tree.column("image", anchor="w", width=360)
+        self.tree.heading("scale", text="Scale")
+        self.tree.column("image", anchor="w", width=320)
         self.tree.column("min", anchor="center", width=100)
         self.tree.column("max", anchor="center", width=100)
         self.tree.column("frequency", anchor="center", width=100)
+        self.tree.column("scale", anchor="center", width=100)
 
         y_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=y_scroll.set)
@@ -359,7 +363,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
             return
         iid = self.tree.identify_row(event.y)
         column = self.tree.identify_column(event.x)
-        if not iid or column not in {"#2", "#3", "#4"}:  # min, max, frequency
+        if not iid or column not in {"#2", "#3", "#4", "#5"}:  # min, max, frequency, scale
             return
 
         self._teardown_editor()
@@ -394,7 +398,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
             self._teardown_editor()
             return
 
-        attr = {"#2": "min_distance", "#3": "max_distance", "#4": "frequency"}[column]
+        attr = {"#2": "min_distance", "#3": "max_distance", "#4": "frequency", "#5": "scale"}[column]
         setattr(item, attr, numeric)
         self.tree.set(iid, column, f"{numeric:.2f}")
         self._teardown_editor()
@@ -561,7 +565,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
             draw_list = sorted(active, key=lambda inst: inst.depth, reverse=True)
             for inst in draw_list:
                 item, image = loaded_items[inst.item_id]
-                scale = project_scale(inst.depth)
+                scale = project_scale(inst.depth) * max(item.scale, 0.0)
                 target_w = int(image.width * scale)
                 target_h = int(image.height * scale)
                 if target_w < 1 or target_h < 1:

@@ -57,6 +57,16 @@ class ParallaxPlaygroundApp(BaseTkClass):
         self._editor: Optional[ttk.Entry] = None
         self._editor_var = tk.StringVar()
 
+        self.direction_var = tk.StringVar(value="right")
+        self.distance_var = tk.DoubleVar(value=50.0)
+        self.rate_var = tk.DoubleVar(value=10.0)
+        self.horizon_height_var = tk.DoubleVar(value=0.5)
+        self.distance_to_horizon_var = tk.DoubleVar(value=100.0)
+        self.horizon_fog_var = tk.DoubleVar(value=0.25)
+        self.horizon_fog_depth_var = tk.DoubleVar(value=50.0)
+        self.foreground_cutoff_var = tk.DoubleVar(value=5.0)
+        self.duration_var = tk.StringVar()
+
         self._build_ui()
         self._configure_drop()
 
@@ -142,7 +152,11 @@ class ParallaxPlaygroundApp(BaseTkClass):
         )
         hint.pack(fill="x", pady=(8, 0))
 
+        self._build_animation_settings(container)
+
         self.tree.bind("<Double-1>", self._start_edit)
+
+        self._update_duration()
 
     # ------------------------------------------------------------------
     def _configure_drop(self) -> None:
@@ -155,6 +169,83 @@ class ParallaxPlaygroundApp(BaseTkClass):
             except Exception:
                 # Fail silently if tkdnd is unavailable at runtime
                 pass
+
+    # ------------------------------------------------------------------
+    def _build_animation_settings(self, container: ttk.Frame) -> None:
+        settings = ttk.LabelFrame(container, text="Animation settings", padding=12)
+        settings.pack(fill="x", pady=(12, 0))
+
+        settings.columnconfigure(1, weight=1)
+        settings.columnconfigure(3, weight=1)
+
+        ttk.Label(settings, text="Direction of travel").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        direction_choices = [
+            "up",
+            "down",
+            "left",
+            "right",
+            "clock-wise",
+            "counter clock-wise",
+        ]
+        direction_menu = ttk.Combobox(
+            settings,
+            textvariable=self.direction_var,
+            values=direction_choices,
+            state="readonly",
+            width=18,
+        )
+        direction_menu.grid(row=0, column=1, sticky="ew", pady=4)
+
+        ttk.Label(settings, text="Distance to travel").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(settings, textvariable=self.distance_var).grid(row=1, column=1, sticky="ew", pady=4)
+
+        ttk.Label(settings, text="Rate of travel").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(settings, textvariable=self.rate_var).grid(row=2, column=1, sticky="ew", pady=4)
+
+        ttk.Label(settings, text="Horizon height (0-1)").grid(row=0, column=2, sticky="w", padx=(16, 8), pady=4)
+        ttk.Entry(settings, textvariable=self.horizon_height_var).grid(row=0, column=3, sticky="ew", pady=4)
+
+        ttk.Label(settings, text="Distance to horizon").grid(row=1, column=2, sticky="w", padx=(16, 8), pady=4)
+        ttk.Entry(settings, textvariable=self.distance_to_horizon_var).grid(row=1, column=3, sticky="ew", pady=4)
+
+        ttk.Label(settings, text="Horizon fog (0-1)").grid(row=2, column=2, sticky="w", padx=(16, 8), pady=4)
+        ttk.Entry(settings, textvariable=self.horizon_fog_var).grid(row=2, column=3, sticky="ew", pady=4)
+
+        ttk.Label(settings, text="Horizon fog depth").grid(row=3, column=2, sticky="w", padx=(16, 8), pady=4)
+        ttk.Entry(settings, textvariable=self.horizon_fog_depth_var).grid(row=3, column=3, sticky="ew", pady=4)
+
+        ttk.Label(settings, text="Foreground cut-off").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(settings, textvariable=self.foreground_cutoff_var).grid(row=3, column=1, sticky="ew", pady=4)
+
+        self.distance_var.trace_add("write", lambda *_: self._update_duration())
+        self.rate_var.trace_add("write", lambda *_: self._update_duration())
+
+        info_bar = ttk.Frame(container)
+        info_bar.pack(fill="x", pady=(8, 0))
+        ttk.Label(info_bar, textvariable=self.duration_var).pack(anchor="w")
+
+    # ------------------------------------------------------------------
+    def _safe_float(self, var: tk.Variable) -> Optional[float]:
+        try:
+            return float(var.get())
+        except (tk.TclError, ValueError):
+            return None
+
+    # ------------------------------------------------------------------
+    def _update_duration(self) -> None:
+        distance = self._safe_float(self.distance_var)
+        rate = self._safe_float(self.rate_var)
+
+        if distance is None or rate is None:
+            self.duration_var.set("Duration: – (enter numeric values)")
+            return
+
+        if rate == 0:
+            self.duration_var.set("Duration: ∞ (rate must be non-zero)")
+            return
+
+        duration = distance / rate
+        self.duration_var.set(f"Duration: {duration:.2f} time units")
 
     # ------------------------------------------------------------------
     def _handle_drop(self, event: tk.Event) -> None:  # pragma: no cover - UI callback

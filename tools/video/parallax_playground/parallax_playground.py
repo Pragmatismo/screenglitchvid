@@ -530,6 +530,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
             lateral_offset = rng.uniform(-self.render_settings.height * 0.12, self.render_settings.height * 0.12)
             active.append(ActiveInstance(item_id=item_id, depth=depth, x=x_pos, lateral_offset=lateral_offset))
 
+        progress_interval = max(1, total_frames // 20)
         for frame_idx in range(total_frames):
             for iid, (item, _image) in loaded_items.items():
                 spawn_budget[iid] += item.frequency * delta_time
@@ -595,8 +596,12 @@ class ParallaxPlaygroundApp(BaseTkClass):
                     )
                 writer.append_data(imageio_frame)
 
+            if frame_idx % progress_interval == 0 or frame_idx == total_frames - 1:
+                print(f"Rendering frame {frame_idx + 1}/{total_frames}...", flush=True)
+
         if writer is not None:
             writer.close()
+        print(f"Render complete. Saved to {output_path}")
         self.last_render_path = output_path
         messagebox.showinfo("Render animation", f"Saved render to {output_path}", parent=self)
 

@@ -9,7 +9,7 @@ from typing import Dict, Optional
 from urllib.parse import unquote, urlparse
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 try:  # Optional drag-and-drop support
     from tkinterdnd2 import DND_FILES, TkinterDnD  # type: ignore
@@ -39,6 +39,16 @@ class ParallaxItem:
         )
 
 
+@dataclass
+class RenderSettings:
+    width: int = 1920
+    height: int = 1080
+    fps: int = 24
+    codec: str = "libx264"
+    start_frame: Optional[int] = None
+    end_frame: Optional[int] = None
+
+
 BaseTkClass = TkinterDnD.Tk if TkinterDnD else tk.Tk
 
 
@@ -66,6 +76,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
         self.horizon_fog_depth_var = tk.DoubleVar(value=50.0)
         self.foreground_cutoff_var = tk.DoubleVar(value=5.0)
         self.duration_var = tk.StringVar()
+        self.render_settings = RenderSettings()
 
         self._build_ui()
         self._configure_drop()
@@ -153,6 +164,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
         hint.pack(fill="x", pady=(8, 0))
 
         self._build_animation_settings(container)
+        self._build_render_controls(container)
 
         self.tree.bind("<Double-1>", self._start_edit)
 
@@ -223,6 +235,18 @@ class ParallaxPlaygroundApp(BaseTkClass):
         info_bar = ttk.Frame(container)
         info_bar.pack(fill="x", pady=(8, 0))
         ttk.Label(info_bar, textvariable=self.duration_var).pack(anchor="w")
+
+    # ------------------------------------------------------------------
+    def _build_render_controls(self, container: ttk.Frame) -> None:
+        ttk.Separator(container).pack(fill="x", pady=(12, 8))
+
+        render_bar = ttk.Frame(container)
+        render_bar.pack(fill="x")
+
+        ttk.Button(render_bar, text="Render settings", command=self._open_render_settings).pack(side="left", padx=(0, 8))
+        ttk.Button(render_bar, text="Render animation", command=self._render_animation).pack(side="left")
+        ttk.Button(render_bar, text="Play last render", command=self._play_last_render).pack(side="left", padx=(8, 0))
+        ttk.Button(render_bar, text="Save to assets", command=self._save_to_assets).pack(side="left", padx=(8, 0))
 
     # ------------------------------------------------------------------
     def _safe_float(self, var: tk.Variable) -> Optional[float]:
@@ -357,6 +381,159 @@ class ParallaxPlaygroundApp(BaseTkClass):
         if self._editor is not None:
             self._editor.destroy()
             self._editor = None
+
+    # ------------------------------------------------------------------
+    def _open_render_settings(self) -> None:  # pragma: no cover - UI callback
+        dialog = RenderSettingsDialog(self, self.render_settings)
+        if dialog.result_settings:
+            self.render_settings = dialog.result_settings
+            messagebox.showinfo(
+                "Render settings",
+                (
+                    f"Updated: {self.render_settings.width}x{self.render_settings.height} "
+                    f"@ {self.render_settings.fps}fps, codec {self.render_settings.codec}"
+                ),
+                parent=self,
+            )
+
+    # ------------------------------------------------------------------
+    def _render_animation(self) -> None:  # pragma: no cover - UI callback
+        print("not yet coded")
+        messagebox.showinfo("Render animation", "Render animation is not yet coded.", parent=self)
+
+    # ------------------------------------------------------------------
+    def _play_last_render(self) -> None:  # pragma: no cover - UI callback
+        messagebox.showinfo("Play last render", "Playback not yet available in this tool.", parent=self)
+
+    # ------------------------------------------------------------------
+    def _save_to_assets(self) -> None:  # pragma: no cover - UI callback
+        messagebox.showinfo("Save to assets", "Saving renders is not yet available in this tool.", parent=self)
+
+
+class RenderSettingsDialog(simpledialog.Dialog):
+    PRESETS = [
+        ("Custom", None, None),
+        ("HD 1080p (1920x1080)", 1920, 1080),
+        ("HD 720p (1280x720)", 1280, 720),
+        ("4K UHD (3840x2160)", 3840, 2160),
+        ("Square 1080 (1080x1080)", 1080, 1080),
+    ]
+
+    CODECS = [
+        ("H.264 (libx264)", "libx264"),
+        ("H.265 (libx265)", "libx265"),
+        ("VP9 (libvpx-vp9)", "libvpx-vp9"),
+        ("QuickTime Animation (qtrle)", "qtrle"),
+    ]
+
+    def __init__(self, parent, settings: RenderSettings):
+        self.settings = settings
+        self.result_settings: Optional[RenderSettings] = None
+        super().__init__(parent, title="Render settings")
+
+    def body(self, master):
+        ttk.Label(master, text="Preset:").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        preset_labels = [label for label, _w, _h in self.PRESETS]
+        self.preset_var = tk.StringVar(value=self._matching_preset_label())
+        preset_combo = ttk.Combobox(master, textvariable=self.preset_var, values=preset_labels, state="readonly")
+        preset_combo.grid(row=0, column=1, columnspan=2, sticky="ew", pady=(0, 4))
+        preset_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
+
+        ttk.Label(master, text="Width:").grid(row=1, column=0, sticky="w")
+        self.width_var = tk.StringVar(value=str(self.settings.width))
+        self.width_entry = ttk.Entry(master, textvariable=self.width_var, width=10)
+        self.width_entry.grid(row=1, column=1, sticky="w")
+
+        ttk.Label(master, text="Height:").grid(row=2, column=0, sticky="w")
+        self.height_var = tk.StringVar(value=str(self.settings.height))
+        ttk.Entry(master, textvariable=self.height_var, width=10).grid(row=2, column=1, sticky="w")
+
+        ttk.Label(master, text="FPS:").grid(row=3, column=0, sticky="w")
+        self.fps_var = tk.StringVar(value=str(self.settings.fps))
+        ttk.Entry(master, textvariable=self.fps_var, width=10).grid(row=3, column=1, sticky="w")
+
+        ttk.Label(master, text="Codec:").grid(row=4, column=0, sticky="w")
+        codec_labels = [label for label, _ in self.CODECS]
+        self.codec_map = {label: key for label, key in self.CODECS}
+        initial_label = next((label for label, key in self.CODECS if key == self.settings.codec), codec_labels[0])
+        self.codec_var = tk.StringVar(value=initial_label)
+        ttk.Combobox(master, textvariable=self.codec_var, values=codec_labels, state="readonly").grid(
+            row=4, column=1, columnspan=2, sticky="ew"
+        )
+
+        ttk.Label(master, text="Render from:").grid(row=5, column=0, sticky="w", pady=(8, 0))
+        self.start_frame_var = tk.StringVar(value=str(self.settings.start_frame or ""))
+        ttk.Entry(master, textvariable=self.start_frame_var, width=10).grid(row=5, column=1, sticky="w", pady=(8, 0))
+
+        ttk.Label(master, text="Render to:").grid(row=6, column=0, sticky="w")
+        self.end_frame_var = tk.StringVar(value=str(self.settings.end_frame or ""))
+        ttk.Entry(master, textvariable=self.end_frame_var, width=10).grid(row=6, column=1, sticky="w")
+
+        master.columnconfigure(1, weight=1)
+        return self.width_entry
+
+    def _matching_preset_label(self) -> str:
+        for label, width, height in self.PRESETS:
+            if width is None or height is None:
+                continue
+            if width == self.settings.width and height == self.settings.height:
+                return label
+        return "Custom"
+
+    def _on_preset_selected(self, _event=None) -> None:
+        label = self.preset_var.get()
+        for preset_label, width, height in self.PRESETS:
+            if label == preset_label and width and height:
+                self.width_var.set(str(width))
+                self.height_var.set(str(height))
+                break
+
+    def validate(self) -> bool:
+        try:
+            width = int(self.width_var.get())
+            height = int(self.height_var.get())
+            fps = int(self.fps_var.get())
+            start = self._parse_optional_int(self.start_frame_var.get())
+            end = self._parse_optional_int(self.end_frame_var.get())
+        except ValueError:
+            messagebox.showerror("Render settings", "Width, height, and FPS must be numbers.", parent=self)
+            return False
+
+        if width <= 0 or height <= 0 or fps <= 0:
+            messagebox.showerror("Render settings", "Width, height, and FPS must be positive.", parent=self)
+            return False
+        if start is not None and start <= 0:
+            messagebox.showerror("Render settings", "Start frame must be at least 1.", parent=self)
+            return False
+        if end is not None and end <= 0:
+            messagebox.showerror("Render settings", "End frame must be at least 1.", parent=self)
+            return False
+        if start is not None and end is not None and end < start:
+            messagebox.showerror(
+                "Render settings",
+                "End frame must be greater than or equal to the start frame.",
+                parent=self,
+            )
+            return False
+        return True
+
+    def apply(self) -> None:
+        codec_label = self.codec_var.get()
+        codec = self.codec_map.get(codec_label, "libx264")
+        self.result_settings = RenderSettings(
+            width=int(self.width_var.get()),
+            height=int(self.height_var.get()),
+            fps=int(self.fps_var.get()),
+            codec=codec,
+            start_frame=self._parse_optional_int(self.start_frame_var.get()),
+            end_frame=self._parse_optional_int(self.end_frame_var.get()),
+        )
+
+    def _parse_optional_int(self, value: str) -> Optional[int]:
+        text = str(value).strip()
+        if not text:
+            return None
+        return int(text)
 
 
 # ---------------------------------------------------------------------------

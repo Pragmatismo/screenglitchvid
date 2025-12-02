@@ -15,7 +15,7 @@ from urllib.parse import unquote, urlparse
 import imageio.v2 as imageio
 import numpy as np
 import tkinter as tk
-from PIL import Image
+from PIL import Image, ImageColor, ImageDraw
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 try:  # Optional drag-and-drop support
@@ -99,6 +99,8 @@ class ParallaxPlaygroundApp(BaseTkClass):
         self.horizon_fog_var = tk.DoubleVar(value=0.25)
         self.horizon_fog_depth_var = tk.DoubleVar(value=50.0)
         self.foreground_cutoff_var = tk.DoubleVar(value=5.0)
+        self.grid_enabled_var = tk.BooleanVar(value=True)
+        self.grid_color_var = tk.StringVar(value="#0b3d0b")
         self.duration_var = tk.StringVar()
         self.render_settings = RenderSettings()
         self.last_render_path: Optional[Path] = None
@@ -255,6 +257,12 @@ class ParallaxPlaygroundApp(BaseTkClass):
 
         ttk.Label(settings, text="Foreground cut-off").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(settings, textvariable=self.foreground_cutoff_var).grid(row=3, column=1, sticky="ew", pady=4)
+
+        ttk.Checkbutton(settings, text="Show perspective grid", variable=self.grid_enabled_var).grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(4, 0)
+        )
+        ttk.Label(settings, text="Grid color").grid(row=4, column=2, sticky="w", padx=(16, 8), pady=(4, 0))
+        ttk.Entry(settings, textvariable=self.grid_color_var).grid(row=4, column=3, sticky="ew", pady=(4, 0))
 
         self.distance_var.trace_add("write", lambda *_: self._update_duration())
         self.rate_var.trace_add("write", lambda *_: self._update_duration())
@@ -437,6 +445,8 @@ class ParallaxPlaygroundApp(BaseTkClass):
         fog_amount = self._safe_float(self.horizon_fog_var)
         fog_depth = self._safe_float(self.horizon_fog_depth_var)
         foreground_cutoff = self._safe_float(self.foreground_cutoff_var)
+        grid_enabled = bool(self.grid_enabled_var.get())
+        grid_color_raw = self.grid_color_var.get().strip() or "#0b3d0b"
 
         if None in {distance, rate, horizon_height, horizon_distance, fog_amount, fog_depth, foreground_cutoff}:
             messagebox.showerror("Render animation", "Please enter numeric animation settings before rendering.", parent=self)
@@ -473,6 +483,11 @@ class ParallaxPlaygroundApp(BaseTkClass):
         sideways_motion = direction in {"left", "right"}
         rotational_motion = direction in {"clock-wise", "counter clock-wise"}
 
+        try:
+            grid_color_rgb = ImageColor.getrgb(grid_color_raw)
+        except ValueError:
+            grid_color_rgb = ImageColor.getrgb("#0b3d0b")
+
         rng = random.Random()
         try:
             loaded_items: Dict[str, tuple[ParallaxItem, Image.Image]] = {
@@ -504,6 +519,9 @@ class ParallaxPlaygroundApp(BaseTkClass):
         def depth_progress(depth: float) -> float:
             return max(0.0, min(1.0, 1 - depth / (horizon_distance + 1e-3)))
 
+        def depth_to_screen_y(depth: float) -> float:
+            return horizon_y + (self.render_settings.height - horizon_y) * depth_progress(depth)
+
         def fog_multiplier(depth: float) -> float:
             if depth <= fog_start:
                 return 1.0
@@ -513,9 +531,11 @@ class ParallaxPlaygroundApp(BaseTkClass):
         def parallax_factor(depth: float) -> float:
             return 0.6 + (horizon_distance / (depth + 1e-3)) * 0.2
 
-        def spawn_instance(item_id: str) -> None:
+        def spawn_instance(item_id: str, depth_override: Optional[float] = None) -> None:
             item, _image = loaded_items[item_id]
-            depth = foreground_cutoff + rng.uniform(max(0.01, item.min_distance), max(0.02, item.max_distance))
+            depth = depth_override if depth_override is not None else foreground_cutoff + rng.uniform(
+                max(0.01, item.min_distance), max(0.02, item.max_distance)
+            )
             if forward_motion:
                 x_pos = rng.uniform(0, self.render_settings.width)
             elif backward_motion:
@@ -530,7 +550,21 @@ class ParallaxPlaygroundApp(BaseTkClass):
             lateral_offset = rng.uniform(-self.render_settings.height * 0.12, self.render_settings.height * 0.12)
             active.append(ActiveInstance(item_id=item_id, depth=depth, x=x_pos, lateral_offset=lateral_offset))
 
+        item_ids = list(loaded_items.keys())
+        initial_depth_samples = np.linspace(
+            max(foreground_cutoff + 0.01, foreground_cutoff), horizon_distance, num=max(6, int(horizon_distance // 10) + 6)
+        )
+        weights = [max(0.05, loaded_items[iid][0].frequency) for iid in item_ids]
+        for depth in initial_depth_samples:
+            chosen = rng.choices(item_ids, weights=weights, k=1)[0]
+            spawn_instance(chosen, depth_override=float(depth))
+
         progress_interval = max(1, total_frames // 20)
+        horizon_x = self.render_settings.width / 2
+        grid_vertical_spacing = max(60.0, self.render_settings.width / 10)
+        pixel_spacing = max(32.0, (self.render_settings.height - horizon_y) / 12)
+        depth_step = pixel_spacing * horizon_distance / max(self.render_settings.height - horizon_y, 1e-3)
+        grid_alpha_color = (*grid_color_rgb, 140)
         for frame_idx in range(total_frames):
             for iid, (item, _image) in loaded_items.items():
                 spawn_budget[iid] += item.frequency * delta_time
@@ -563,6 +597,20 @@ class ParallaxPlaygroundApp(BaseTkClass):
             active = updated_active
 
             frame = Image.new("RGBA", (self.render_settings.width, self.render_settings.height), "black")
+            if grid_enabled:
+                draw = ImageDraw.Draw(frame, "RGBA")
+                x = 0.0
+                while x <= self.render_settings.width + 1:
+                    draw.line([(x, self.render_settings.height), (horizon_x, horizon_y)], fill=grid_alpha_color, width=1)
+                    x += grid_vertical_spacing
+
+                depth = foreground_cutoff
+                while depth <= horizon_distance:
+                    y = depth_to_screen_y(depth)
+                    if y < horizon_y:
+                        break
+                    draw.line([(0, y), (self.render_settings.width, y)], fill=grid_alpha_color, width=1)
+                    depth += depth_step
             draw_list = sorted(active, key=lambda inst: inst.depth, reverse=True)
             for inst in draw_list:
                 item, image = loaded_items[inst.item_id]
@@ -572,8 +620,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
                 if target_w < 1 or target_h < 1:
                     continue
                 scaled = image.resize((target_w, target_h), RESAMPLE)
-                depth_factor = depth_progress(inst.depth)
-                y_pos = horizon_y + (self.render_settings.height - horizon_y) * depth_factor + inst.lateral_offset
+                y_pos = depth_to_screen_y(inst.depth) + inst.lateral_offset
                 y_pos = max(-target_h, min(self.render_settings.height + target_h, y_pos))
                 alpha = fog_multiplier(inst.depth)
                 if alpha < 1.0:

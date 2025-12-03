@@ -836,6 +836,38 @@ class ParallaxPlaygroundApp(BaseTkClass):
                 y += spacing_step
         self._render_map()
 
+    def _blend_canvas_color(self, color: str, background: str) -> str:
+        """Convert RGBA hex colors to a Tk-friendly RGB string by blending with a background."""
+
+        def hex_to_rgb(value: str) -> tuple[int, int, int]:
+            value = value.lstrip("#")
+            if len(value) != 6:
+                raise ValueError("Expected #RRGGBB format")
+            return tuple(int(value[i : i + 2], 16) for i in (0, 2, 4))
+
+        color = (color or "").strip()
+        background = (background or "#000000").strip()
+
+        try:
+            if color.startswith("#") and len(color) == 9:
+                fg = color[1:7]
+                alpha = int(color[7:9], 16) / 255.0
+                fg_r, fg_g, fg_b = hex_to_rgb(fg)
+                bg_r, bg_g, bg_b = hex_to_rgb(background)
+                blended = (
+                    round(fg_r * alpha + bg_r * (1 - alpha)),
+                    round(fg_g * alpha + bg_g * (1 - alpha)),
+                    round(fg_b * alpha + bg_b * (1 - alpha)),
+                )
+                return "#%02x%02x%02x" % blended
+
+            if color.startswith("#") and len(color) == 7:
+                return color
+        except ValueError:
+            pass
+
+        return background
+
     def _render_map(self) -> None:
         if not self._map_canvas:
             return
@@ -846,7 +878,8 @@ class ParallaxPlaygroundApp(BaseTkClass):
             return
         scale = self.map_zoom_var.get()
         canvas.configure(scrollregion=(0, 0, self.map_width * scale, self.map_depth * scale))
-        canvas.create_rectangle(0, 0, self.map_width * scale, self.map_depth * scale, fill="#0a0a0a", outline="#222")
+        map_background = "#0a0a0a"
+        canvas.create_rectangle(0, 0, self.map_width * scale, self.map_depth * scale, fill=map_background, outline="#222")
         def to_canvas(pt: tuple[float, float]) -> tuple[float, float]:
             return self._map_to_canvas(pt[0], pt[1])
 
@@ -856,8 +889,8 @@ class ParallaxPlaygroundApp(BaseTkClass):
         end = (self.map_camera_end_x, max(0.0, self.map_camera_end_depth))
         start_canvas = to_canvas(start)
         end_canvas = to_canvas(end)
-        triangle_color = "#f2e55ca0"
-        end_color = "#fff7b54a"
+        triangle_color = self._blend_canvas_color("#f2e55ca0", map_background)
+        end_color = self._blend_canvas_color("#fff7b54a", map_background)
         canvas.create_polygon(
             start_canvas[0],
             start_canvas[1],
@@ -878,13 +911,14 @@ class ParallaxPlaygroundApp(BaseTkClass):
             fill=end_color,
             outline="",
         )
-        canvas.create_line(start_canvas[0], start_canvas[1], end_canvas[0], end_canvas[1], fill="#f8f3c560", dash=(3, 2))
+        line_color = self._blend_canvas_color("#f8f3c560", map_background)
+        canvas.create_line(start_canvas[0], start_canvas[1], end_canvas[0], end_canvas[1], fill=line_color, dash=(3, 2))
         canvas.create_line(
             start_canvas[0] - base_width * 0.5 * scale,
             self.map_depth * scale,
             end_canvas[0] - base_width * 0.5 * scale,
             self.map_depth * scale,
-            fill="#f8f3c560",
+            fill=line_color,
             dash=(3, 2),
         )
         canvas.create_line(
@@ -892,7 +926,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
             self.map_depth * scale,
             end_canvas[0] + base_width * 0.5 * scale,
             self.map_depth * scale,
-            fill="#f8f3c560",
+            fill=line_color,
             dash=(3, 2),
         )
 

@@ -1246,6 +1246,13 @@ class ParallaxPlaygroundApp(BaseTkClass):
         if not items:
             messagebox.showwarning("Render animation", "Add at least one image before rendering.", parent=self)
             return
+        if not self.map_points or not self._map_ready():
+            messagebox.showwarning(
+                "Render animation",
+                "Use the Map tab to lay out items and define a camera path before rendering.",
+                parent=self,
+            )
+            return
 
         distance = self._safe_float(self.distance_var)
         rate = self._safe_float(self.rate_var)
@@ -1286,7 +1293,12 @@ class ParallaxPlaygroundApp(BaseTkClass):
             return
 
         fps = self.render_settings.fps
-        duration = abs(distance / rate)
+        speed = abs(rate)
+        map_travel = math.hypot(
+            self.map_camera_end_x - self.map_camera_start_x,
+            self.map_camera_end_depth - self.map_camera_start_depth,
+        )
+        duration = max(map_travel, abs(distance)) / max(speed, 1e-6)
         total_frames = max(1, math.ceil(duration * fps))
         start_frame = self.render_settings.start_frame or 1
         end_frame = self.render_settings.end_frame or total_frames
@@ -1304,19 +1316,11 @@ class ParallaxPlaygroundApp(BaseTkClass):
             foreground_cutoff=foreground_cutoff,
         )
         horizon_y = geometry.horizon_y()
-        direction = self.direction_var.get()
-        horizontal_sign = -1 if direction in {"right", "clock-wise"} else 1
-        forward_motion = direction == "up"
-        backward_motion = direction == "down"
-        sideways_motion = direction in {"left", "right"}
-        rotational_motion = direction in {"clock-wise", "counter clock-wise"}
-
         try:
             grid_color_rgb = ImageColor.getrgb(grid_color_raw)
         except ValueError:
             grid_color_rgb = ImageColor.getrgb("#0b3d0b")
 
-        rng = random.Random()
         try:
             loaded_items: Dict[str, tuple[ParallaxItem, Image.Image]] = {
                 iid: (item, Image.open(item.image_path).convert("RGBA")) for iid, item in items
@@ -1328,36 +1332,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
             messagebox.showerror("Render animation", f"Failed to load images: {exc}", parent=self)
             return
 
-        use_map = bool(self.map_points)
-        if use_map and self.map_width <= 0:
-            self.map_width = max(horizon_distance * 1.6, abs(distance) + horizon_distance)
-        if use_map and self.map_depth <= 0:
-            self.map_depth = horizon_distance
-
-        placed_active: list[ActiveInstance] = []
-        if not use_map and self.placed_items:
-            for placed in self.placed_items:
-                if placed.item_id not in loaded_items:
-                    continue
-                depth = min(max(placed.depth, foreground_cutoff + 0.01), horizon_distance + fog_depth)
-                landscape_width = geometry.landscape_width_at_depth(depth)
-                x_world = placed.landscape_fraction * landscape_width
-                x_pos = (self.render_settings.width / 2) + (x_world - landscape_width / 2)
-                placed_active.append(
-                    ActiveInstance(
-                        item_id=placed.item_id,
-                        depth=depth,
-                        x=x_pos,
-                        lateral_offset=0.0,
-                        landscape_fraction=placed.landscape_fraction,
-                    )
-                )
-        active: list[ActiveInstance] = placed_active
-        speed = abs(rate)
-        delta_depth = speed / fps
-        delta_time = 1 / fps
         fog_start = max(0.0, horizon_distance - fog_depth)
-        parallax_margin = 80
         output_name = f"parallax_render_{int(time.time())}.mp4"
         output_path = self.project_assets_dir / output_name
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1369,100 +1344,45 @@ class ParallaxPlaygroundApp(BaseTkClass):
             fog_ratio = min(1.0, (depth - fog_start) / max(fog_depth, 1e-3))
             return 1.0 - fog_ratio * fog_amount
 
-        def parallax_factor(depth: float) -> float:
-            return 0.6 + (horizon_distance / (depth + 1e-3)) * 0.2
-
-        if not use_map:
-            for iid, (item, _image) in loaded_items.items():
-                count = max(0, int(round(item.frequency)))
-                if count == 0:
-                    continue
-                lateral_offset_range = self.render_settings.height * 0.12
-                for idx in range(count):
-                    depth = foreground_cutoff + rng.uniform(
-                        max(0.01, item.min_distance), max(0.02, item.max_distance)
-                    )
-                    landscape_width = geometry.landscape_width_at_depth(depth)
-                    segment = landscape_width / count
-                    x_world = idx * segment + rng.uniform(0, segment)
-                    x_pos = (self.render_settings.width / 2) + (x_world - landscape_width / 2)
-                    lateral_offset = rng.uniform(-lateral_offset_range, lateral_offset_range)
-                    active.append(
-                        ActiveInstance(
-                            item_id=iid,
-                            depth=depth,
-                            x=x_pos,
-                            lateral_offset=lateral_offset,
-                            landscape_fraction=x_world / max(landscape_width, 1e-3),
-                        )
-                    )
-
         progress_interval = max(1, total_frames // 20)
         horizon_x = self.render_settings.width / 2
         grid_vertical_spacing = max(8.0, self._safe_float(self.grid_vertical_spacing_var) or (self.render_settings.width / 10))
         depth_step = max(0.5, self._safe_float(self.grid_depth_spacing_var) or 10.0)
         grid_alpha_color = (*grid_color_rgb, 140)
+
+        camera_start_x = self.map_camera_start_x or (self.map_width / 2)
+        camera_end_x = self.map_camera_end_x or camera_start_x
+        camera_start_depth = self.map_camera_start_depth
+        camera_end_depth = self.map_camera_end_depth
+
         for frame_idx in range(total_frames):
             progress = frame_idx / max(total_frames - 1, 1)
-            if use_map:
-                frame_active: list[ActiveInstance] = []
-                camera_x = self.map_camera_start_x + (self.map_camera_end_x - self.map_camera_start_x) * progress
-                camera_depth = self.map_camera_start_depth + (self.map_camera_end_depth - self.map_camera_start_depth) * progress
-                camera_width = self._view_width_at_distance(
-                    max(camera_depth, foreground_cutoff), field_of_view
-                )
-                for point in self.map_points:
-                    if point.item_id not in loaded_items:
-                        continue
-                    relative_depth = point.depth - camera_depth
-                    if relative_depth <= foreground_cutoff or relative_depth >= horizon_distance + fog_depth:
-                        continue
-                    visible_width = self._view_width_at_distance(relative_depth, field_of_view)
-                    x_offset = point.x - camera_x
-                    x_pos = (self.render_settings.width / 2) + (
-                        x_offset / max(camera_width, 1e-3)
-                    ) * visible_width
-                    frame_active.append(
-                        ActiveInstance(
-                            item_id=point.item_id,
-                            depth=relative_depth,
-                            x=x_pos,
-                            lateral_offset=0.0,
-                            landscape_fraction=0.5,
-                        )
+            camera_x = camera_start_x + (camera_end_x - camera_start_x) * progress
+            camera_depth = camera_start_depth + (camera_end_depth - camera_start_depth) * progress
+
+            frame_active: list[ActiveInstance] = []
+            for point in self.map_points:
+                if point.item_id not in loaded_items:
+                    continue
+                relative_depth = point.depth - camera_depth
+                if relative_depth <= foreground_cutoff or relative_depth >= horizon_distance + fog_depth:
+                    continue
+                visible_width = self._view_width_at_distance(relative_depth, field_of_view)
+                x_offset = point.x - camera_x
+                normalized = x_offset / max(visible_width / 2, 1e-6)
+                screen_x = (self.render_settings.width / 2) + normalized * (self.render_settings.width / 2)
+                frame_active.append(
+                    ActiveInstance(
+                        item_id=point.item_id,
+                        depth=relative_depth,
+                        x=screen_x,
+                        lateral_offset=0.0,
+                        landscape_fraction=0.5,
                     )
-            else:
-                updated_active: list[ActiveInstance] = []
-                for instance in active:
-                    if forward_motion:
-                        instance.depth -= delta_depth
-                        if instance.depth <= foreground_cutoff:
-                            continue
-                        landscape_width = geometry.landscape_width_at_depth(instance.depth)
-                        instance.x = (self.render_settings.width / 2) + (
-                            instance.landscape_fraction * landscape_width - landscape_width / 2
-                        )
-                    elif backward_motion:
-                        instance.depth += delta_depth
-                        if instance.depth >= horizon_distance + fog_depth:
-                            continue
-                        landscape_width = geometry.landscape_width_at_depth(instance.depth)
-                        instance.x = (self.render_settings.width / 2) + (
-                            instance.landscape_fraction * landscape_width - landscape_width / 2
-                        )
-                    elif sideways_motion:
-                        factor = parallax_factor(instance.depth)
-                        instance.x += horizontal_sign * speed * delta_time * factor
-                        if instance.x < -parallax_margin or instance.x > self.render_settings.width + parallax_margin:
-                            continue
-                    elif rotational_motion:
-                        factor = parallax_factor(instance.depth)
-                        instance.x += horizontal_sign * speed * delta_time * factor * 0.6
-                    updated_active.append(instance)
-                active = updated_active
-                frame_active = active
+                )
 
             frame = Image.new("RGBA", (self.render_settings.width, self.render_settings.height), "black")
+            draw: Optional[ImageDraw.ImageDraw] = None
             if grid_enabled:
                 draw = ImageDraw.Draw(frame, "RGBA")
                 try:

@@ -6,7 +6,6 @@ import argparse
 import math
 import random
 import time
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
@@ -788,7 +787,6 @@ class ParallaxPlaygroundApp(BaseTkClass):
                 placed_active.append(
                     ActiveInstance(item_id=placed.item_id, depth=depth, x=x_pos, lateral_offset=0.0)
                 )
-        spawn_budget: Dict[str, float] = defaultdict(float)
         active: list[ActiveInstance] = placed_active
         speed = abs(rate)
         delta_depth = speed / fps
@@ -809,33 +807,26 @@ class ParallaxPlaygroundApp(BaseTkClass):
         def parallax_factor(depth: float) -> float:
             return 0.6 + (horizon_distance / (depth + 1e-3)) * 0.2
 
-        def spawn_instance(item_id: str, depth_override: Optional[float] = None) -> None:
-            item, _image = loaded_items[item_id]
-            depth = depth_override if depth_override is not None else foreground_cutoff + rng.uniform(
-                max(0.01, item.min_distance), max(0.02, item.max_distance)
-            )
-            if forward_motion:
-                x_pos = rng.uniform(0, self.render_settings.width)
-            elif backward_motion:
-                x_pos = rng.uniform(0, self.render_settings.width)
-            elif sideways_motion or rotational_motion:
-                if direction == "right":
-                    x_pos = self.render_settings.width + parallax_margin
-                elif direction == "left":
-                    x_pos = -parallax_margin
-                else:  # rotation
-                    x_pos = rng.uniform(-parallax_margin, self.render_settings.width + parallax_margin)
-            lateral_offset = rng.uniform(-self.render_settings.height * 0.12, self.render_settings.height * 0.12)
-            active.append(ActiveInstance(item_id=item_id, depth=depth, x=x_pos, lateral_offset=lateral_offset))
+        def landscape_width_at_depth(depth: float) -> float:
+            depth = max(depth, 1e-3)
+            # Treat the landscape as widening as it approaches the camera.
+            return self.render_settings.width * max(1.0, geometry.horizon_distance / depth)
 
-        item_ids = list(loaded_items.keys())
-        initial_depth_samples = np.linspace(
-            max(foreground_cutoff + 0.01, foreground_cutoff), horizon_distance, num=max(6, int(horizon_distance // 10) + 6)
-        )
-        weights = [max(0.05, loaded_items[iid][0].frequency) for iid in item_ids]
-        for depth in initial_depth_samples:
-            chosen = rng.choices(item_ids, weights=weights, k=1)[0]
-            spawn_instance(chosen, depth_override=float(depth))
+        for iid, (item, _image) in loaded_items.items():
+            count = max(0, int(round(item.frequency)))
+            if count == 0:
+                continue
+            lateral_offset_range = self.render_settings.height * 0.12
+            for idx in range(count):
+                depth = foreground_cutoff + rng.uniform(
+                    max(0.01, item.min_distance), max(0.02, item.max_distance)
+                )
+                landscape_width = landscape_width_at_depth(depth)
+                segment = landscape_width / count
+                x_world = idx * segment + rng.uniform(0, segment)
+                x_pos = (self.render_settings.width / 2) + (x_world - landscape_width / 2)
+                lateral_offset = rng.uniform(-lateral_offset_range, lateral_offset_range)
+                active.append(ActiveInstance(item_id=iid, depth=depth, x=x_pos, lateral_offset=lateral_offset))
 
         progress_interval = max(1, total_frames // 20)
         horizon_x = self.render_settings.width / 2
@@ -843,15 +834,6 @@ class ParallaxPlaygroundApp(BaseTkClass):
         depth_step = max(0.5, self._safe_float(self.grid_depth_spacing_var) or 10.0)
         grid_alpha_color = (*grid_color_rgb, 140)
         for frame_idx in range(total_frames):
-            for iid, (item, _image) in loaded_items.items():
-                spawn_budget[iid] += item.frequency * delta_time
-                while spawn_budget[iid] >= 1:
-                    spawn_instance(iid)
-                    spawn_budget[iid] -= 1
-                if spawn_budget[iid] > 0 and rng.random() < spawn_budget[iid]:
-                    spawn_instance(iid)
-                    spawn_budget[iid] = 0
-
             updated_active: list[ActiveInstance] = []
             for instance in active:
                 if forward_motion:
@@ -895,18 +877,37 @@ class ParallaxPlaygroundApp(BaseTkClass):
                     depth += depth_step
                 draw.line([(0, horizon_y), (self.render_settings.width, horizon_y)], fill=grid_alpha_color, width=1)
             draw_list = sorted(active, key=lambda inst: inst.depth, reverse=True)
+            draw_context: Optional[ImageDraw.ImageDraw] = draw if grid_enabled else None
             for inst in draw_list:
                 item, image = loaded_items[inst.item_id]
                 scale = geometry.projected_scale(inst.depth) * max(item.scale, 0.0)
-                target_w = int(image.width * scale)
-                target_h = int(image.height * scale)
-                if target_w < 1 or target_h < 1:
-                    continue
-                scaled = image.resize((target_w, target_h), RESAMPLE)
+                target_w = max(1, int(image.width * scale))
+                target_h = max(1, int(image.height * scale))
                 ground_y = geometry.depth_to_screen_y(inst.depth) + inst.lateral_offset
                 y_pos = ground_y - target_h / 2
                 y_pos = max(-target_h, min(self.render_settings.height + target_h, y_pos))
                 alpha = fog_multiplier(inst.depth)
+                bbox = (
+                    inst.x - target_w / 2,
+                    y_pos - target_h / 2,
+                    inst.x + target_w / 2,
+                    y_pos + target_h / 2,
+                )
+                if bbox[2] < 0 or bbox[0] > self.render_settings.width:
+                    continue
+                if bbox[3] < 0 or bbox[1] > self.render_settings.height:
+                    continue
+                if target_w < 4 or target_h < 4:
+                    if draw_context is None:
+                        draw_context = ImageDraw.Draw(frame, "RGBA")
+                    alpha_int = int(alpha * 255)
+                    shade = (40, 40, 40, alpha_int)
+                    draw_context.rectangle(
+                        [(int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3]))],
+                        fill=shade,
+                    )
+                    continue
+                scaled = image.resize((target_w, target_h), RESAMPLE)
                 if alpha < 1.0:
                     alpha_layer = scaled.split()[3].point(lambda a: int(a * alpha))
                     scaled.putalpha(alpha_layer)

@@ -184,6 +184,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
         self.map_points: list[MapPoint] = []
         self.map_width: float = 0.0
         self.map_depth: float = 0.0
+        self.map_horizon_distance: float = 0.0
         self.map_camera_start_x: float = 0.0
         self.map_camera_end_x: float = 0.0
         self.map_camera_start_depth: float = 0.0
@@ -583,6 +584,10 @@ class ParallaxPlaygroundApp(BaseTkClass):
         self.map_zoom_var.set(new_zoom)
         self._render_map()
 
+    def _view_width_at_distance(self, distance: float, fov_degrees: float) -> float:
+        half_angle = math.radians(max(1.0, fov_degrees) / 2)
+        return max(20.0, math.tan(half_angle) * distance * 2)
+
     def _map_to_canvas(self, x: float, depth: float) -> tuple[float, float]:
         scale = self.map_zoom_var.get()
         return x * scale, depth * scale
@@ -598,23 +603,37 @@ class ParallaxPlaygroundApp(BaseTkClass):
     def _create_map(self) -> None:
         horizon_distance = max(1.0, self._safe_float(self.distance_to_horizon_var) or 1.0)
         travel_distance = abs(self._safe_float(self.distance_var) or 0.0)
-        base_width = max(horizon_distance * 1.6, travel_distance * 1.4 + 120.0)
-        self.map_width = base_width
-        self.map_depth = horizon_distance
+        fov_value = max(1.0, self._safe_float(self.field_of_view_var) or 60.0)
+        foreground_depth = max(0.01, self._safe_float(self.foreground_cutoff_var) or 1.0)
+
+        horizon_width = self._view_width_at_distance(horizon_distance, fov_value)
+        foreground_width = self._view_width_at_distance(foreground_depth, fov_value)
+        half_width = max(horizon_width, foreground_width) / 2
+
+        self.map_horizon_distance = horizon_distance
         self.map_points = []
-        start_x = base_width / 2
-        end_x = start_x
+
+        direction = self.direction_var.get()
         start_depth = 0.0
         end_depth = 0.0
-        direction = self.direction_var.get()
-        if direction in {"right", "clock-wise"}:
-            end_x = start_x + travel_distance
-        elif direction in {"left", "counter clock-wise"}:
-            end_x = start_x - travel_distance
-        elif direction == "up":
+        if direction == "up":
             end_depth = travel_distance
         elif direction == "down":
-            end_depth = -travel_distance
+            start_depth = travel_distance
+
+        if direction in {"right", "clock-wise"}:
+            start_x = half_width
+            end_x = start_x + travel_distance
+        elif direction in {"left", "counter clock-wise"}:
+            end_x = half_width
+            start_x = end_x + travel_distance
+        else:
+            start_x = end_x = half_width
+
+        max_depth = max(start_depth, end_depth)
+        max_center = max(start_x, end_x)
+        self.map_width = max_center + half_width
+        self.map_depth = max_depth + horizon_distance
         self.map_camera_start_x = start_x
         self.map_camera_end_x = end_x
         self.map_camera_start_depth = start_depth
@@ -884,51 +903,36 @@ class ParallaxPlaygroundApp(BaseTkClass):
             return self._map_to_canvas(pt[0], pt[1])
 
         fov_value = self._safe_float(self.field_of_view_var) or 60.0
-        base_width = max(40.0, math.tan(math.radians(max(10.0, fov_value / 2))) * self.map_depth)
+        foreground_depth = max(0.01, self._safe_float(self.foreground_cutoff_var) or 1.0)
+        horizon_distance = self.map_horizon_distance or self.map_depth
+        foreground_width = self._view_width_at_distance(foreground_depth, fov_value)
+        horizon_width = self._view_width_at_distance(horizon_distance, fov_value)
         start = (self.map_camera_start_x, max(0.0, self.map_camera_start_depth))
         end = (self.map_camera_end_x, max(0.0, self.map_camera_end_depth))
-        start_canvas = to_canvas(start)
-        end_canvas = to_canvas(end)
+
+        def frustum_points(center: tuple[float, float]) -> list[tuple[float, float]]:
+            center_x, camera_depth = center
+            near_depth = camera_depth + foreground_depth
+            far_depth = camera_depth + horizon_distance
+            left_bottom = to_canvas((center_x - foreground_width * 0.5, near_depth))
+            right_bottom = to_canvas((center_x + foreground_width * 0.5, near_depth))
+            right_top = to_canvas((center_x + horizon_width * 0.5, far_depth))
+            left_top = to_canvas((center_x - horizon_width * 0.5, far_depth))
+            return [left_bottom, right_bottom, right_top, left_top]
+
+        start_points = frustum_points(start)
+        end_points = frustum_points(end)
         triangle_color = self._blend_canvas_color("#f2e55ca0", map_background)
         end_color = self._blend_canvas_color("#fff7b54a", map_background)
-        canvas.create_polygon(
-            start_canvas[0],
-            start_canvas[1],
-            start_canvas[0] - base_width * 0.5 * scale,
-            self.map_depth * scale,
-            start_canvas[0] + base_width * 0.5 * scale,
-            self.map_depth * scale,
-            fill=triangle_color,
-            outline="",
-        )
-        canvas.create_polygon(
-            end_canvas[0],
-            end_canvas[1],
-            end_canvas[0] - base_width * 0.5 * scale,
-            self.map_depth * scale,
-            end_canvas[0] + base_width * 0.5 * scale,
-            self.map_depth * scale,
-            fill=end_color,
-            outline="",
-        )
+        canvas.create_polygon(*[coord for pt in start_points for coord in pt], fill=triangle_color, outline="")
+        canvas.create_polygon(*[coord for pt in end_points for coord in pt], fill=end_color, outline="")
+
         line_color = self._blend_canvas_color("#f8f3c560", map_background)
+        start_canvas = to_canvas(start)
+        end_canvas = to_canvas(end)
         canvas.create_line(start_canvas[0], start_canvas[1], end_canvas[0], end_canvas[1], fill=line_color, dash=(3, 2))
-        canvas.create_line(
-            start_canvas[0] - base_width * 0.5 * scale,
-            self.map_depth * scale,
-            end_canvas[0] - base_width * 0.5 * scale,
-            self.map_depth * scale,
-            fill=line_color,
-            dash=(3, 2),
-        )
-        canvas.create_line(
-            start_canvas[0] + base_width * 0.5 * scale,
-            self.map_depth * scale,
-            end_canvas[0] + base_width * 0.5 * scale,
-            self.map_depth * scale,
-            fill=line_color,
-            dash=(3, 2),
-        )
+        for idx in range(4):
+            canvas.create_line(*start_points[idx], *end_points[idx], fill=line_color, dash=(3, 2))
 
         for point in self.map_points:
             color = self.item_colors.get(point.item_id, "#cccccc")

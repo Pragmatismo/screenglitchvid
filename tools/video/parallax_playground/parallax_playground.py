@@ -80,7 +80,7 @@ class PlacedItem:
     """Snapshot of an item placed on the preview landscape."""
 
     item_id: str
-    x_fraction: float
+    landscape_fraction: float
     depth: float
 
 
@@ -145,6 +145,16 @@ class PerspectiveMath:
 
     def depth_step_for_spacing(self, pixel_spacing: float) -> float:
         return pixel_spacing * self.horizon_distance / max(self.height - self.horizon_y(), 1e-3)
+
+    def landscape_width_at_depth(self, depth: float) -> float:
+        """Estimate the visible landscape width at a given depth.
+
+        This lets us translate between a placement point on the ground plane and the
+        screen-space x coordinate for the current camera position.
+        """
+
+        depth = max(depth, 1e-3)
+        return self.width * max(1.0, self.horizon_distance / depth)
 
 
 class ParallaxPlaygroundApp(BaseTkClass):
@@ -548,6 +558,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
         distance = max(0.0, min(geometry.horizon_distance, self._safe_float(self.preview_distance_var) or 0.0))
         y_line = geometry.depth_to_screen_y(distance)
         positions = [geometry.width * (idx + 1) / (len(loaded) + 1) for idx in range(len(loaded))]
+        landscape_width = geometry.landscape_width_at_depth(distance)
 
         for x_pos, (_iid, item, image) in zip(positions, loaded):
             scale = geometry.projected_scale(max(distance, 0.01)) * max(item.scale, 0.0)
@@ -557,7 +568,11 @@ class ParallaxPlaygroundApp(BaseTkClass):
             top_left = (int(x_pos - target_w / 2), int(y_line - target_h))
             base.alpha_composite(resized, dest=top_left)
             if record_positions:
-                self.placed_items.append(PlacedItem(item_id=_iid, x_fraction=x_pos / geometry.width, depth=distance))
+                landscape_x = x_pos - geometry.width / 2 + landscape_width / 2
+                landscape_fraction = max(0.0, min(1.0, landscape_x / landscape_width))
+                self.placed_items.append(
+                    PlacedItem(item_id=_iid, landscape_fraction=landscape_fraction, depth=distance)
+                )
             ImageDraw.Draw(base, "RGBA").line([(0, y_line), (geometry.width, y_line)], fill=(*grid_color_rgb, 120), width=1)
 
     # ------------------------------------------------------------------
@@ -783,7 +798,9 @@ class ParallaxPlaygroundApp(BaseTkClass):
                 if placed.item_id not in loaded_items:
                     continue
                 depth = min(max(placed.depth, foreground_cutoff + 0.01), horizon_distance + fog_depth)
-                x_pos = placed.x_fraction * self.render_settings.width
+                landscape_width = geometry.landscape_width_at_depth(depth)
+                x_world = placed.landscape_fraction * landscape_width
+                x_pos = (self.render_settings.width / 2) + (x_world - landscape_width / 2)
                 placed_active.append(
                     ActiveInstance(item_id=placed.item_id, depth=depth, x=x_pos, lateral_offset=0.0)
                 )
@@ -807,11 +824,6 @@ class ParallaxPlaygroundApp(BaseTkClass):
         def parallax_factor(depth: float) -> float:
             return 0.6 + (horizon_distance / (depth + 1e-3)) * 0.2
 
-        def landscape_width_at_depth(depth: float) -> float:
-            depth = max(depth, 1e-3)
-            # Treat the landscape as widening as it approaches the camera.
-            return self.render_settings.width * max(1.0, geometry.horizon_distance / depth)
-
         for iid, (item, _image) in loaded_items.items():
             count = max(0, int(round(item.frequency)))
             if count == 0:
@@ -821,7 +833,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
                 depth = foreground_cutoff + rng.uniform(
                     max(0.01, item.min_distance), max(0.02, item.max_distance)
                 )
-                landscape_width = landscape_width_at_depth(depth)
+                landscape_width = geometry.landscape_width_at_depth(depth)
                 segment = landscape_width / count
                 x_world = idx * segment + rng.uniform(0, segment)
                 x_pos = (self.render_settings.width / 2) + (x_world - landscape_width / 2)
@@ -884,14 +896,14 @@ class ParallaxPlaygroundApp(BaseTkClass):
                 target_w = max(1, int(image.width * scale))
                 target_h = max(1, int(image.height * scale))
                 ground_y = geometry.depth_to_screen_y(inst.depth) + inst.lateral_offset
-                y_pos = ground_y - target_h / 2
-                y_pos = max(-target_h, min(self.render_settings.height + target_h, y_pos))
+                top_y = ground_y - target_h
+                top_y = max(-target_h, min(self.render_settings.height + target_h, top_y))
                 alpha = fog_multiplier(inst.depth)
                 bbox = (
                     inst.x - target_w / 2,
-                    y_pos - target_h / 2,
+                    top_y,
                     inst.x + target_w / 2,
-                    y_pos + target_h / 2,
+                    top_y + target_h,
                 )
                 if bbox[2] < 0 or bbox[0] > self.render_settings.width:
                     continue
@@ -913,7 +925,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
                     scaled.putalpha(alpha_layer)
                 frame.alpha_composite(
                     scaled,
-                    (int(inst.x - target_w / 2), int(y_pos - target_h / 2)),
+                    (int(inst.x - target_w / 2), int(top_y)),
                 )
 
             if start_frame - 1 <= frame_idx <= end_frame - 1:

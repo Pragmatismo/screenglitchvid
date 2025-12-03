@@ -86,20 +86,54 @@ class PerspectiveMath:
     horizon_distance: float
     field_of_view: float
     foreground_cutoff: float = 0.0
+    camera_height: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        """Derive a sensible camera height if one was not provided."""
+
+        if self.camera_height is None:
+            # Keep the camera above the landscape so items can slide underneath.
+            self.camera_height = max(0.5, self.horizon_distance * 0.18)
+
+    @property
+    def fov_radians(self) -> float:
+        return math.radians(max(1e-3, self.field_of_view))
+
+    @property
+    def pitch_radians(self) -> float:
+        return (self.horizon_height - 0.5) * self.fov_radians
 
     def horizon_y(self) -> float:
         return self.height * self.horizon_height
 
     def depth_progress(self, depth: float) -> float:
-        return max(0.0, min(1.0, 1 - depth / (self.horizon_distance + 1e-3)))
+        span = self.height - self.horizon_y()
+        if span <= 0:
+            return 0.0
+        return (self.depth_to_screen_y(depth) - self.horizon_y()) / span
 
     def depth_to_screen_y(self, depth: float) -> float:
-        return self.horizon_y() + (self.height - self.horizon_y()) * self.depth_progress(depth)
+        camera_height = self.camera_height or 1.0
+        angle = math.atan2(-camera_height, max(depth, 1e-5)) + self.pitch_radians
+        screen_fraction = 0.5 - angle / self.fov_radians
+        return screen_fraction * self.height
+
+    def angular_span(self, distance: float, unit_height: float = 1.0) -> float:
+        """Return the angular size of a vertical unit at the given distance."""
+
+        camera_height = self.camera_height or 1.0
+        depth = max(distance, 1e-5)
+        bottom_angle = math.atan2(-camera_height, depth) + self.pitch_radians
+        top_angle = math.atan2(unit_height - camera_height, depth) + self.pitch_radians
+        return max(1e-6, top_angle - bottom_angle)
 
     def projected_scale(self, depth: float, base_scale: float = 0.1) -> float:
+        zero_distance = max(self.foreground_cutoff, 0.01)
+        reference_span = self.angular_span(zero_distance)
+        span = self.angular_span(max(depth, 0.01))
         fov_factor = max(0.4, min(1.6, self.field_of_view / 60.0))
-        base = (self.horizon_distance / max(depth, 1e-3)) * base_scale * fov_factor
-        return max(0.05, min(base, 6.0))
+        base = (span / reference_span) * base_scale * fov_factor
+        return max(0.02, min(base, 6.0))
 
     def depth_step_for_spacing(self, pixel_spacing: float) -> float:
         return pixel_spacing * self.horizon_distance / max(self.height - self.horizon_y(), 1e-3)

@@ -15,7 +15,7 @@ from urllib.parse import unquote, urlparse
 import imageio.v2 as imageio
 import numpy as np
 import tkinter as tk
-from PIL import Image, ImageColor, ImageDraw
+from PIL import Image, ImageColor, ImageDraw, ImageTk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 try:  # Optional drag-and-drop support
@@ -76,6 +76,35 @@ class RenderSettings:
 BaseTkClass = TkinterDnD.Tk if TkinterDnD else tk.Tk
 
 
+@dataclass
+class PerspectiveMath:
+    """Shared helpers for projecting depth onto the 2D canvas."""
+
+    width: int
+    height: int
+    horizon_height: float
+    horizon_distance: float
+    field_of_view: float
+    foreground_cutoff: float = 0.0
+
+    def horizon_y(self) -> float:
+        return self.height * self.horizon_height
+
+    def depth_progress(self, depth: float) -> float:
+        return max(0.0, min(1.0, 1 - depth / (self.horizon_distance + 1e-3)))
+
+    def depth_to_screen_y(self, depth: float) -> float:
+        return self.horizon_y() + (self.height - self.horizon_y()) * self.depth_progress(depth)
+
+    def projected_scale(self, depth: float, base_scale: float = 0.1) -> float:
+        fov_factor = max(0.4, min(1.6, self.field_of_view / 60.0))
+        base = (self.horizon_distance / max(depth, 1e-3)) * base_scale * fov_factor
+        return max(0.05, min(base, 6.0))
+
+    def depth_step_for_spacing(self, pixel_spacing: float) -> float:
+        return pixel_spacing * self.horizon_distance / max(self.height - self.horizon_y(), 1e-3)
+
+
 class ParallaxPlaygroundApp(BaseTkClass):
     """UI for configuring parallax items."""
 
@@ -96,14 +125,22 @@ class ParallaxPlaygroundApp(BaseTkClass):
         self.rate_var = tk.DoubleVar(value=10.0)
         self.horizon_height_var = tk.DoubleVar(value=0.5)
         self.distance_to_horizon_var = tk.DoubleVar(value=100.0)
+        self.field_of_view_var = tk.DoubleVar(value=60.0)
         self.horizon_fog_var = tk.DoubleVar(value=0.25)
         self.horizon_fog_depth_var = tk.DoubleVar(value=50.0)
         self.foreground_cutoff_var = tk.DoubleVar(value=5.0)
         self.grid_enabled_var = tk.BooleanVar(value=True)
         self.grid_color_var = tk.StringVar(value="#0b3d0b")
+        self.grid_background_color_var = tk.StringVar(value="#050505")
+        self.grid_vertical_spacing_var = tk.DoubleVar(value=160.0)
+        self.grid_depth_spacing_var = tk.DoubleVar(value=10.0)
         self.duration_var = tk.StringVar()
+        self.preview_distance_var = tk.DoubleVar(value=10.0)
         self.render_settings = RenderSettings()
         self.last_render_path: Optional[Path] = None
+        self._preview_after_id: Optional[str] = None
+        self._preview_image: Optional[Image.Image] = None
+        self._preview_photo: Optional[ImageTk.PhotoImage] = None
 
         self._build_ui()
         self._configure_drop()
@@ -264,12 +301,60 @@ class ParallaxPlaygroundApp(BaseTkClass):
         ttk.Label(settings, text="Grid color").grid(row=4, column=2, sticky="w", padx=(16, 8), pady=(4, 0))
         ttk.Entry(settings, textvariable=self.grid_color_var).grid(row=4, column=3, sticky="ew", pady=(4, 0))
 
+        ttk.Label(settings, text="Grid background").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(settings, textvariable=self.grid_background_color_var).grid(row=5, column=1, sticky="ew", pady=4)
+        ttk.Label(settings, text="Field of view").grid(row=5, column=2, sticky="w", padx=(16, 8), pady=4)
+        ttk.Entry(settings, textvariable=self.field_of_view_var).grid(row=5, column=3, sticky="ew", pady=4)
+        ttk.Label(settings, text="Vertical line spacing").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(settings, textvariable=self.grid_vertical_spacing_var).grid(row=6, column=1, sticky="ew", pady=4)
+        ttk.Label(settings, text="Depth line spacing").grid(row=6, column=2, sticky="w", padx=(16, 8), pady=4)
+        ttk.Entry(settings, textvariable=self.grid_depth_spacing_var).grid(row=6, column=3, sticky="ew", pady=4)
+
         self.distance_var.trace_add("write", lambda *_: self._update_duration())
         self.rate_var.trace_add("write", lambda *_: self._update_duration())
+        for var in (
+            self.horizon_height_var,
+            self.distance_to_horizon_var,
+            self.field_of_view_var,
+            self.grid_vertical_spacing_var,
+            self.grid_depth_spacing_var,
+            self.grid_color_var,
+            self.grid_background_color_var,
+            self.grid_enabled_var,
+        ):
+            var.trace_add("write", lambda *_: self._schedule_preview_refresh())
 
         info_bar = ttk.Frame(container)
         info_bar.pack(fill="x", pady=(8, 0))
         ttk.Label(info_bar, textvariable=self.duration_var).pack(anchor="w")
+
+        self._build_preview_panel(container)
+
+    def _build_preview_panel(self, container: ttk.Frame) -> None:
+        preview = ttk.LabelFrame(container, text="Scene preview", padding=12)
+        preview.pack(fill="both", pady=(12, 0))
+
+        controls = ttk.Frame(preview)
+        controls.pack(fill="x", pady=(0, 8))
+        ttk.Label(controls, text="Item distance").pack(side="left")
+        self.preview_distance_scale = ttk.Scale(
+            controls,
+            variable=self.preview_distance_var,
+            from_=0.0,
+            to=self.distance_to_horizon_var.get(),
+            command=lambda _evt=None: self._update_preview_distance_label(),
+        )
+        self.preview_distance_scale.pack(side="left", fill="x", expand=True, padx=8)
+        self.preview_distance_label = ttk.Label(controls, text="0.00")
+        self.preview_distance_label.pack(side="left", padx=(0, 8))
+        ttk.Button(controls, text="Place items", command=self._preview_place_items).pack(side="left")
+
+        canvas_frame = ttk.Frame(preview)
+        canvas_frame.pack(fill="both", expand=True)
+        self.preview_canvas = tk.Canvas(canvas_frame, width=780, height=260, highlightthickness=1, highlightbackground="#333")
+        self.preview_canvas.pack(fill="both", expand=True)
+        self._update_preview_distance_label()
+        self._schedule_preview_refresh()
 
     # ------------------------------------------------------------------
     def _build_render_controls(self, container: ttk.Frame) -> None:
@@ -305,6 +390,130 @@ class ParallaxPlaygroundApp(BaseTkClass):
 
         duration = distance / rate
         self.duration_var.set(f"Duration: {duration:.2f} time units")
+
+    # ------------------------------------------------------------------
+    def _update_preview_distance_label(self) -> None:
+        value = self._safe_float(self.preview_distance_var) or 0.0
+        self.preview_distance_label.configure(text=f"{value:.2f}")
+
+    # ------------------------------------------------------------------
+    def _schedule_preview_refresh(self) -> None:
+        if self._preview_after_id is not None:
+            try:
+                self.after_cancel(self._preview_after_id)
+            except Exception:
+                pass
+        self._preview_after_id = self.after(120, self._render_preview_background)
+
+    # ------------------------------------------------------------------
+    def _preview_geometry(self, width: int, height: int) -> Optional[PerspectiveMath]:
+        horizon_height = self._safe_float(self.horizon_height_var)
+        horizon_distance = self._safe_float(self.distance_to_horizon_var)
+        field_of_view = self._safe_float(self.field_of_view_var)
+        foreground_cutoff = self._safe_float(self.foreground_cutoff_var) or 0.0
+        if None in {horizon_height, horizon_distance, field_of_view}:
+            return None
+        assert horizon_height is not None and horizon_distance is not None and field_of_view is not None
+        horizon_height = min(1.0, max(0.0, horizon_height))
+        horizon_distance = max(0.01, horizon_distance)
+        field_of_view = max(1.0, field_of_view)
+        return PerspectiveMath(
+            width=width,
+            height=height,
+            horizon_height=horizon_height,
+            horizon_distance=horizon_distance,
+            field_of_view=field_of_view,
+            foreground_cutoff=max(0.0, foreground_cutoff),
+        )
+
+    # ------------------------------------------------------------------
+    def _render_preview_background(self, include_items: bool = False) -> None:
+        self._preview_after_id = None
+        width = max(int(self.preview_canvas.winfo_width()) or 0, 780)
+        height = max(int(self.preview_canvas.winfo_height()) or 0, 260)
+        geometry = self._preview_geometry(width, height)
+        if geometry is None:
+            return
+
+        try:
+            grid_color_rgb = ImageColor.getrgb(self.grid_color_var.get().strip() or "#0b3d0b")
+        except ValueError:
+            grid_color_rgb = ImageColor.getrgb("#0b3d0b")
+        try:
+            background_rgb = ImageColor.getrgb(self.grid_background_color_var.get().strip() or "#050505")
+        except ValueError:
+            background_rgb = ImageColor.getrgb("#050505")
+
+        self.preview_distance_scale.configure(to=geometry.horizon_distance)
+        current_distance = self._safe_float(self.preview_distance_var) or 0.0
+        if current_distance > geometry.horizon_distance:
+            self.preview_distance_var.set(geometry.horizon_distance)
+        self._update_preview_distance_label()
+
+        horizon_y = geometry.horizon_y()
+        img = Image.new("RGBA", (width, height), "#0a0a0a")
+        draw = ImageDraw.Draw(img, "RGBA")
+        draw.rectangle([(0, horizon_y), (width, height)], fill=background_rgb)
+        grid_alpha_color = (*grid_color_rgb, 200)
+
+        if self.grid_enabled_var.get():
+            vanish_x = width / 2
+            spacing = max(8.0, self._safe_float(self.grid_vertical_spacing_var) or (width / 10))
+            factor = min(0.6, max(0.05, (self._safe_float(self.field_of_view_var) or 60.0) / 200))
+            x = 0.0
+            while x <= width + 1:
+                top_x = vanish_x + (x - vanish_x) * factor
+                draw.line([(x, height), (top_x, horizon_y)], fill=grid_alpha_color, width=1)
+                x += spacing
+
+            depth_spacing = max(0.5, self._safe_float(self.grid_depth_spacing_var) or 10.0)
+            depth = geometry.foreground_cutoff
+            while depth <= geometry.horizon_distance:
+                y = geometry.depth_to_screen_y(depth)
+                if y < horizon_y:
+                    break
+                draw.line([(0, y), (width, y)], fill=grid_alpha_color, width=1)
+                depth += depth_spacing
+            draw.line([(0, horizon_y), (width, horizon_y)], fill=grid_alpha_color, width=1)
+
+        if include_items:
+            self._overlay_preview_items(img, geometry, grid_color_rgb)
+
+        self._preview_image = img
+        self._preview_photo = ImageTk.PhotoImage(img)
+        self.preview_canvas.delete("all")
+        self.preview_canvas.create_image(0, 0, anchor="nw", image=self._preview_photo)
+
+    # ------------------------------------------------------------------
+    def _overlay_preview_items(self, base: Image.Image, geometry: PerspectiveMath, grid_color_rgb: tuple[int, int, int]) -> None:
+        items = list(self.items.items())[:5]
+        if not items:
+            return
+        try:
+            loaded = [(iid, item, Image.open(item.image_path).convert("RGBA")) for iid, item in items]
+        except FileNotFoundError:
+            messagebox.showerror("Scene preview", "One or more image paths are missing.", parent=self)
+            return
+        except Exception as exc:
+            messagebox.showerror("Scene preview", f"Failed to load images: {exc}", parent=self)
+            return
+
+        distance = max(0.0, min(geometry.horizon_distance, self._safe_float(self.preview_distance_var) or 0.0))
+        y_line = geometry.depth_to_screen_y(distance)
+        positions = [geometry.width * (idx + 1) / (len(loaded) + 1) for idx in range(len(loaded))]
+
+        for x_pos, (_iid, item, image) in zip(positions, loaded):
+            scale = geometry.projected_scale(max(distance, 0.01)) * max(item.scale, 0.0)
+            target_w = int(max(1, image.width * scale))
+            target_h = int(max(1, image.height * scale))
+            resized = image.resize((target_w, target_h), RESAMPLE)
+            top_left = (int(x_pos - target_w / 2), int(y_line - target_h))
+            base.alpha_composite(resized, dest=top_left)
+            ImageDraw.Draw(base, "RGBA").line([(0, y_line), (geometry.width, y_line)], fill=(*grid_color_rgb, 120), width=1)
+
+    # ------------------------------------------------------------------
+    def _preview_place_items(self) -> None:
+        self._render_preview_background(include_items=True)
 
     # ------------------------------------------------------------------
     def _handle_drop(self, event: tk.Event) -> None:  # pragma: no cover - UI callback
@@ -442,17 +651,28 @@ class ParallaxPlaygroundApp(BaseTkClass):
         rate = self._safe_float(self.rate_var)
         horizon_height = self._safe_float(self.horizon_height_var)
         horizon_distance = self._safe_float(self.distance_to_horizon_var)
+        field_of_view = self._safe_float(self.field_of_view_var)
         fog_amount = self._safe_float(self.horizon_fog_var)
         fog_depth = self._safe_float(self.horizon_fog_depth_var)
         foreground_cutoff = self._safe_float(self.foreground_cutoff_var)
         grid_enabled = bool(self.grid_enabled_var.get())
         grid_color_raw = self.grid_color_var.get().strip() or "#0b3d0b"
+        grid_background_raw = self.grid_background_color_var.get().strip() or "#050505"
 
-        if None in {distance, rate, horizon_height, horizon_distance, fog_amount, fog_depth, foreground_cutoff}:
+        if None in {
+            distance,
+            rate,
+            horizon_height,
+            horizon_distance,
+            fog_amount,
+            fog_depth,
+            foreground_cutoff,
+            field_of_view,
+        }:
             messagebox.showerror("Render animation", "Please enter numeric animation settings before rendering.", parent=self)
             return
         assert distance is not None and rate is not None
-        assert horizon_height is not None and horizon_distance is not None
+        assert horizon_height is not None and horizon_distance is not None and field_of_view is not None
         assert fog_amount is not None and fog_depth is not None and foreground_cutoff is not None
 
         if rate == 0:
@@ -475,7 +695,15 @@ class ParallaxPlaygroundApp(BaseTkClass):
             messagebox.showerror("Render animation", "Start frame must be before end frame.", parent=self)
             return
 
-        horizon_y = self.render_settings.height * horizon_height
+        geometry = PerspectiveMath(
+            width=self.render_settings.width,
+            height=self.render_settings.height,
+            horizon_height=horizon_height,
+            horizon_distance=horizon_distance,
+            field_of_view=field_of_view,
+            foreground_cutoff=foreground_cutoff,
+        )
+        horizon_y = geometry.horizon_y()
         direction = self.direction_var.get()
         horizontal_sign = -1 if direction in {"right", "clock-wise"} else 1
         forward_motion = direction == "up"
@@ -511,16 +739,6 @@ class ParallaxPlaygroundApp(BaseTkClass):
         output_path = self.project_assets_dir / output_name
         output_path.parent.mkdir(parents=True, exist_ok=True)
         writer = None
-
-        def project_scale(depth: float) -> float:
-            base = horizon_distance / max(depth, 1e-3) * 0.1
-            return max(0.05, min(base, 6.0))
-
-        def depth_progress(depth: float) -> float:
-            return max(0.0, min(1.0, 1 - depth / (horizon_distance + 1e-3)))
-
-        def depth_to_screen_y(depth: float) -> float:
-            return horizon_y + (self.render_settings.height - horizon_y) * depth_progress(depth)
 
         def fog_multiplier(depth: float) -> float:
             if depth <= fog_start:
@@ -561,9 +779,8 @@ class ParallaxPlaygroundApp(BaseTkClass):
 
         progress_interval = max(1, total_frames // 20)
         horizon_x = self.render_settings.width / 2
-        grid_vertical_spacing = max(60.0, self.render_settings.width / 10)
-        pixel_spacing = max(32.0, (self.render_settings.height - horizon_y) / 12)
-        depth_step = pixel_spacing * horizon_distance / max(self.render_settings.height - horizon_y, 1e-3)
+        grid_vertical_spacing = max(8.0, self._safe_float(self.grid_vertical_spacing_var) or (self.render_settings.width / 10))
+        depth_step = max(0.5, self._safe_float(self.grid_depth_spacing_var) or 10.0)
         grid_alpha_color = (*grid_color_rgb, 140)
         for frame_idx in range(total_frames):
             for iid, (item, _image) in loaded_items.items():
@@ -599,6 +816,11 @@ class ParallaxPlaygroundApp(BaseTkClass):
             frame = Image.new("RGBA", (self.render_settings.width, self.render_settings.height), "black")
             if grid_enabled:
                 draw = ImageDraw.Draw(frame, "RGBA")
+                try:
+                    background_rgb = ImageColor.getrgb(grid_background_raw)
+                except ValueError:
+                    background_rgb = ImageColor.getrgb("#050505")
+                draw.rectangle([(0, horizon_y), (self.render_settings.width, self.render_settings.height)], fill=background_rgb)
                 x = 0.0
                 while x <= self.render_settings.width + 1:
                     draw.line([(x, self.render_settings.height), (horizon_x, horizon_y)], fill=grid_alpha_color, width=1)
@@ -606,21 +828,22 @@ class ParallaxPlaygroundApp(BaseTkClass):
 
                 depth = foreground_cutoff
                 while depth <= horizon_distance:
-                    y = depth_to_screen_y(depth)
+                    y = geometry.depth_to_screen_y(depth)
                     if y < horizon_y:
                         break
                     draw.line([(0, y), (self.render_settings.width, y)], fill=grid_alpha_color, width=1)
                     depth += depth_step
+                draw.line([(0, horizon_y), (self.render_settings.width, horizon_y)], fill=grid_alpha_color, width=1)
             draw_list = sorted(active, key=lambda inst: inst.depth, reverse=True)
             for inst in draw_list:
                 item, image = loaded_items[inst.item_id]
-                scale = project_scale(inst.depth) * max(item.scale, 0.0)
+                scale = geometry.projected_scale(inst.depth) * max(item.scale, 0.0)
                 target_w = int(image.width * scale)
                 target_h = int(image.height * scale)
                 if target_w < 1 or target_h < 1:
                     continue
                 scaled = image.resize((target_w, target_h), RESAMPLE)
-                y_pos = depth_to_screen_y(inst.depth) + inst.lateral_offset
+                y_pos = geometry.depth_to_screen_y(inst.depth) + inst.lateral_offset
                 y_pos = max(-target_h, min(self.render_settings.height + target_h, y_pos))
                 alpha = fog_multiplier(inst.depth)
                 if alpha < 1.0:

@@ -77,6 +77,15 @@ BaseTkClass = TkinterDnD.Tk if TkinterDnD else tk.Tk
 
 
 @dataclass
+class PlacedItem:
+    """Snapshot of an item placed on the preview landscape."""
+
+    item_id: str
+    x_fraction: float
+    depth: float
+
+
+@dataclass
 class PerspectiveMath:
     """Shared helpers for projecting depth onto the 2D canvas."""
 
@@ -151,6 +160,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
         self.repo_root = Path(__file__).resolve().parents[3]
         self.project_assets_dir = self._resolve_assets_dir(args.project)
         self.items: Dict[str, ParallaxItem] = {}
+        self.placed_items: list[PlacedItem] = []
         self._editor: Optional[ttk.Entry] = None
         self._editor_var = tk.StringVar()
 
@@ -461,7 +471,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
         )
 
     # ------------------------------------------------------------------
-    def _render_preview_background(self, include_items: bool = False) -> None:
+    def _render_preview_background(self, include_items: bool = False, record_positions: bool = False) -> None:
         self._preview_after_id = None
         width = max(int(self.preview_canvas.winfo_width()) or 0, 780)
         height = max(int(self.preview_canvas.winfo_height()) or 0, 260)
@@ -511,7 +521,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
             draw.line([(0, horizon_y), (width, horizon_y)], fill=grid_alpha_color, width=1)
 
         if include_items:
-            self._overlay_preview_items(img, geometry, grid_color_rgb)
+            self._overlay_preview_items(img, geometry, grid_color_rgb, record_positions=record_positions)
 
         self._preview_image = img
         self._preview_photo = ImageTk.PhotoImage(img)
@@ -519,10 +529,14 @@ class ParallaxPlaygroundApp(BaseTkClass):
         self.preview_canvas.create_image(0, 0, anchor="nw", image=self._preview_photo)
 
     # ------------------------------------------------------------------
-    def _overlay_preview_items(self, base: Image.Image, geometry: PerspectiveMath, grid_color_rgb: tuple[int, int, int]) -> None:
+    def _overlay_preview_items(
+        self, base: Image.Image, geometry: PerspectiveMath, grid_color_rgb: tuple[int, int, int], record_positions: bool = False
+    ) -> None:
         items = list(self.items.items())[:5]
         if not items:
             return
+        if record_positions:
+            self.placed_items = []
         try:
             loaded = [(iid, item, Image.open(item.image_path).convert("RGBA")) for iid, item in items]
         except FileNotFoundError:
@@ -543,11 +557,13 @@ class ParallaxPlaygroundApp(BaseTkClass):
             resized = image.resize((target_w, target_h), RESAMPLE)
             top_left = (int(x_pos - target_w / 2), int(y_line - target_h))
             base.alpha_composite(resized, dest=top_left)
+            if record_positions:
+                self.placed_items.append(PlacedItem(item_id=_iid, x_fraction=x_pos / geometry.width, depth=distance))
             ImageDraw.Draw(base, "RGBA").line([(0, y_line), (geometry.width, y_line)], fill=(*grid_color_rgb, 120), width=1)
 
     # ------------------------------------------------------------------
     def _preview_place_items(self) -> None:
-        self._render_preview_background(include_items=True)
+        self._render_preview_background(include_items=True, record_positions=True)
 
     # ------------------------------------------------------------------
     def _handle_drop(self, event: tk.Event) -> None:  # pragma: no cover - UI callback
@@ -762,8 +778,18 @@ class ParallaxPlaygroundApp(BaseTkClass):
             messagebox.showerror("Render animation", f"Failed to load images: {exc}", parent=self)
             return
 
+        placed_active: list[ActiveInstance] = []
+        if self.placed_items:
+            for placed in self.placed_items:
+                if placed.item_id not in loaded_items:
+                    continue
+                depth = min(max(placed.depth, foreground_cutoff + 0.01), horizon_distance + fog_depth)
+                x_pos = placed.x_fraction * self.render_settings.width
+                placed_active.append(
+                    ActiveInstance(item_id=placed.item_id, depth=depth, x=x_pos, lateral_offset=0.0)
+                )
         spawn_budget: Dict[str, float] = defaultdict(float)
-        active: list[ActiveInstance] = []
+        active: list[ActiveInstance] = placed_active
         speed = abs(rate)
         delta_depth = speed / fps
         delta_time = 1 / fps
@@ -877,7 +903,8 @@ class ParallaxPlaygroundApp(BaseTkClass):
                 if target_w < 1 or target_h < 1:
                     continue
                 scaled = image.resize((target_w, target_h), RESAMPLE)
-                y_pos = geometry.depth_to_screen_y(inst.depth) + inst.lateral_offset
+                ground_y = geometry.depth_to_screen_y(inst.depth) + inst.lateral_offset
+                y_pos = ground_y - target_h / 2
                 y_pos = max(-target_h, min(self.render_settings.height + target_h, y_pos))
                 alpha = fog_multiplier(inst.depth)
                 if alpha < 1.0:

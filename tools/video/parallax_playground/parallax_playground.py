@@ -1393,6 +1393,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
                 frame_active: list[ActiveInstance] = []
                 camera_x = self.map_camera_start_x + (self.map_camera_end_x - self.map_camera_start_x) * progress
                 camera_depth = self.map_camera_start_depth + (self.map_camera_end_depth - self.map_camera_start_depth) * progress
+                camera_width = geometry.landscape_width_at_depth(max(camera_depth, foreground_cutoff))
                 for point in self.map_points:
                     if point.item_id not in loaded_items:
                         continue
@@ -1401,7 +1402,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
                         continue
                     visible_width = geometry.landscape_width_at_depth(relative_depth)
                     x_offset = point.x - camera_x
-                    x_pos = (self.render_settings.width / 2) + (x_offset / max(self.map_width, 1e-3)) * visible_width
+                    x_pos = (self.render_settings.width / 2) + (x_offset / max(camera_width, 1e-3)) * visible_width
                     frame_active.append(
                         ActiveInstance(item_id=point.item_id, depth=relative_depth, x=x_pos, lateral_offset=0.0)
                     )

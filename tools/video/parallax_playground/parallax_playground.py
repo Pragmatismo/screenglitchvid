@@ -41,6 +41,7 @@ class ActiveInstance:
     depth: float
     x: float
     lateral_offset: float
+    landscape_fraction: float
 
 
 @dataclass
@@ -1343,7 +1344,13 @@ class ParallaxPlaygroundApp(BaseTkClass):
                 x_world = placed.landscape_fraction * landscape_width
                 x_pos = (self.render_settings.width / 2) + (x_world - landscape_width / 2)
                 placed_active.append(
-                    ActiveInstance(item_id=placed.item_id, depth=depth, x=x_pos, lateral_offset=0.0)
+                    ActiveInstance(
+                        item_id=placed.item_id,
+                        depth=depth,
+                        x=x_pos,
+                        lateral_offset=0.0,
+                        landscape_fraction=placed.landscape_fraction,
+                    )
                 )
         active: list[ActiveInstance] = placed_active
         speed = abs(rate)
@@ -1380,7 +1387,15 @@ class ParallaxPlaygroundApp(BaseTkClass):
                     x_world = idx * segment + rng.uniform(0, segment)
                     x_pos = (self.render_settings.width / 2) + (x_world - landscape_width / 2)
                     lateral_offset = rng.uniform(-lateral_offset_range, lateral_offset_range)
-                    active.append(ActiveInstance(item_id=iid, depth=depth, x=x_pos, lateral_offset=lateral_offset))
+                    active.append(
+                        ActiveInstance(
+                            item_id=iid,
+                            depth=depth,
+                            x=x_pos,
+                            lateral_offset=lateral_offset,
+                            landscape_fraction=x_world / max(landscape_width, 1e-3),
+                        )
+                    )
 
         progress_interval = max(1, total_frames // 20)
         horizon_x = self.render_settings.width / 2
@@ -1408,7 +1423,13 @@ class ParallaxPlaygroundApp(BaseTkClass):
                         x_offset / max(camera_width, 1e-3)
                     ) * visible_width
                     frame_active.append(
-                        ActiveInstance(item_id=point.item_id, depth=relative_depth, x=x_pos, lateral_offset=0.0)
+                        ActiveInstance(
+                            item_id=point.item_id,
+                            depth=relative_depth,
+                            x=x_pos,
+                            lateral_offset=0.0,
+                            landscape_fraction=0.5,
+                        )
                     )
             else:
                 updated_active: list[ActiveInstance] = []
@@ -1417,10 +1438,18 @@ class ParallaxPlaygroundApp(BaseTkClass):
                         instance.depth -= delta_depth
                         if instance.depth <= foreground_cutoff:
                             continue
+                        landscape_width = geometry.landscape_width_at_depth(instance.depth)
+                        instance.x = (self.render_settings.width / 2) + (
+                            instance.landscape_fraction * landscape_width - landscape_width / 2
+                        )
                     elif backward_motion:
                         instance.depth += delta_depth
                         if instance.depth >= horizon_distance + fog_depth:
                             continue
+                        landscape_width = geometry.landscape_width_at_depth(instance.depth)
+                        instance.x = (self.render_settings.width / 2) + (
+                            instance.landscape_fraction * landscape_width - landscape_width / 2
+                        )
                     elif sideways_motion:
                         factor = parallax_factor(instance.depth)
                         instance.x += horizontal_sign * speed * delta_time * factor

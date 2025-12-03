@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import random
 import time
@@ -81,6 +82,15 @@ class PlacedItem:
 
     item_id: str
     landscape_fraction: float
+    depth: float
+
+
+@dataclass
+class MapPoint:
+    """Represents a persistent placement on the map canvas."""
+
+    item_id: str
+    x: float
     depth: float
 
 
@@ -170,6 +180,15 @@ class ParallaxPlaygroundApp(BaseTkClass):
         self.project_assets_dir = self._resolve_assets_dir(args.project)
         self.items: Dict[str, ParallaxItem] = {}
         self.placed_items: list[PlacedItem] = []
+        self._item_choice_lookup: Dict[str, str] = {}
+        self.map_points: list[MapPoint] = []
+        self.map_width: float = 0.0
+        self.map_depth: float = 0.0
+        self.map_camera_start_x: float = 0.0
+        self.map_camera_end_x: float = 0.0
+        self.map_camera_start_depth: float = 0.0
+        self.map_camera_end_depth: float = 0.0
+        self.item_colors: Dict[str, str] = {}
         self._editor: Optional[ttk.Entry] = None
         self._editor_var = tk.StringVar()
 
@@ -189,11 +208,22 @@ class ParallaxPlaygroundApp(BaseTkClass):
         self.grid_depth_spacing_var = tk.DoubleVar(value=10.0)
         self.duration_var = tk.StringVar()
         self.preview_distance_var = tk.DoubleVar(value=10.0)
+        self.view_mode_var = tk.StringVar(value="preview")
+        self.map_zoom_var = tk.DoubleVar(value=1.0)
+        self.brush_size_var = tk.DoubleVar(value=120.0)
+        self.density_var = tk.DoubleVar(value=1.0)
+        self.conformity_var = tk.DoubleVar(value=0.6)
+        self.min_separation_var = tk.DoubleVar(value=18.0)
+        self.draw_tool_var = tk.StringVar(value="single")
+        self.selected_item_var = tk.StringVar()
         self.render_settings = RenderSettings()
         self.last_render_path: Optional[Path] = None
         self._preview_after_id: Optional[str] = None
         self._preview_image: Optional[Image.Image] = None
         self._preview_photo: Optional[ImageTk.PhotoImage] = None
+        self._map_canvas: Optional[tk.Canvas] = None
+        self._map_image_id: Optional[int] = None
+        self._map_start: Optional[tuple[float, float]] = None
 
         self._build_ui()
         self._configure_drop()
@@ -288,6 +318,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
         self.tree.bind("<Double-1>", self._start_edit)
 
         self._update_duration()
+        self._refresh_item_choices()
 
     # ------------------------------------------------------------------
     def _configure_drop(self) -> None:
@@ -384,10 +415,22 @@ class ParallaxPlaygroundApp(BaseTkClass):
         self._build_preview_panel(container)
 
     def _build_preview_panel(self, container: ttk.Frame) -> None:
-        preview = ttk.LabelFrame(container, text="Scene preview", padding=12)
+        preview = ttk.LabelFrame(container, text="Preview and map", padding=12)
         preview.pack(fill="both", pady=(12, 0))
 
-        controls = ttk.Frame(preview)
+        notebook = ttk.Notebook(preview)
+        notebook.pack(fill="both", expand=True)
+        preview_tab = ttk.Frame(notebook)
+        map_tab = ttk.Frame(notebook)
+        notebook.add(preview_tab, text="Preview")
+        notebook.add(map_tab, text="Map")
+        notebook.bind("<<NotebookTabChanged>>", lambda _evt=None: self._on_view_changed(notebook))
+
+        self._build_preview_tab(preview_tab)
+        self._build_map_tab(map_tab)
+
+    def _build_preview_tab(self, parent: ttk.Frame) -> None:
+        controls = ttk.Frame(parent)
         controls.pack(fill="x", pady=(0, 8))
         ttk.Label(controls, text="Item distance").pack(side="left")
         self.preview_distance_scale = ttk.Scale(
@@ -402,12 +445,463 @@ class ParallaxPlaygroundApp(BaseTkClass):
         self.preview_distance_label.pack(side="left", padx=(0, 8))
         ttk.Button(controls, text="Place items", command=self._preview_place_items).pack(side="left")
 
-        canvas_frame = ttk.Frame(preview)
+        canvas_frame = ttk.Frame(parent)
         canvas_frame.pack(fill="both", expand=True)
         self.preview_canvas = tk.Canvas(canvas_frame, width=780, height=260, highlightthickness=1, highlightbackground="#333")
         self.preview_canvas.pack(fill="both", expand=True)
         self._update_preview_distance_label()
         self._schedule_preview_refresh()
+
+    def _build_map_tab(self, parent: ttk.Frame) -> None:
+        controls = ttk.Frame(parent)
+        controls.pack(fill="x", pady=(0, 8))
+
+        ttk.Button(controls, text="Create map", command=self._create_map).pack(side="left")
+        ttk.Button(controls, text="Auto generate", command=self._auto_generate_map).pack(side="left", padx=6)
+        ttk.Button(controls, text="Save map", command=self._save_map).pack(side="left", padx=6)
+        ttk.Button(controls, text="Load map", command=self._load_map).pack(side="left", padx=6)
+        ttk.Label(controls, textvariable=self.duration_var).pack(side="right")
+
+        item_row = ttk.Frame(parent)
+        item_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(item_row, text="Item").grid(row=0, column=0, padx=(0, 6))
+        self.item_choice = ttk.Combobox(item_row, textvariable=self.selected_item_var, state="readonly", width=30)
+        self.item_choice.grid(row=0, column=1, padx=(0, 12), sticky="ew")
+        ttk.Label(item_row, text="Tool").grid(row=0, column=2, padx=(0, 6))
+        ttk.Combobox(
+            item_row,
+            textvariable=self.draw_tool_var,
+            values=["single", "spray", "line", "square"],
+            state="readonly",
+            width=12,
+        ).grid(row=0, column=3, padx=(0, 12))
+        ttk.Label(item_row, text="Brush").grid(row=0, column=4, padx=(0, 6))
+        ttk.Entry(item_row, textvariable=self.brush_size_var, width=8).grid(row=0, column=5)
+        ttk.Label(item_row, text="Density").grid(row=0, column=6, padx=(12, 6))
+        ttk.Entry(item_row, textvariable=self.density_var, width=8).grid(row=0, column=7)
+        ttk.Label(item_row, text="Conformity (0-1)").grid(row=0, column=8, padx=(12, 6))
+        ttk.Entry(item_row, textvariable=self.conformity_var, width=8).grid(row=0, column=9)
+        ttk.Label(item_row, text="Min spacing").grid(row=0, column=10, padx=(12, 6))
+        ttk.Entry(item_row, textvariable=self.min_separation_var, width=8).grid(row=0, column=11)
+
+        zoom_row = ttk.Frame(parent)
+        zoom_row.pack(fill="x", pady=(0, 8))
+        ttk.Button(zoom_row, text="Zoom in", command=lambda: self._adjust_map_zoom(1.2)).pack(side="left")
+        ttk.Button(zoom_row, text="Zoom out", command=lambda: self._adjust_map_zoom(0.8)).pack(side="left", padx=6)
+        ttk.Label(zoom_row, text="View mode: map shows positions used for rendering").pack(side="left", padx=12)
+
+        canvas_frame = ttk.Frame(parent)
+        canvas_frame.pack(fill="both", expand=True)
+        self._map_canvas = tk.Canvas(
+            canvas_frame,
+            width=780,
+            height=320,
+            highlightthickness=1,
+            highlightbackground="#333",
+            background="#0a0a0a",
+        )
+        hbar = ttk.Scrollbar(canvas_frame, orient="horizontal", command=self._map_canvas.xview)
+        vbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=self._map_canvas.yview)
+        self._map_canvas.configure(xscrollcommand=hbar.set, yscrollcommand=vbar.set)
+        self._map_canvas.grid(row=0, column=0, sticky="nsew")
+        vbar.grid(row=0, column=1, sticky="ns")
+        hbar.grid(row=1, column=0, sticky="ew")
+        canvas_frame.rowconfigure(0, weight=1)
+        canvas_frame.columnconfigure(0, weight=1)
+
+        self._map_canvas.bind("<ButtonPress-1>", self._on_map_press)
+        self._map_canvas.bind("<B1-Motion>", self._on_map_drag)
+        self._map_canvas.bind("<ButtonRelease-1>", self._on_map_release)
+
+        legend = ttk.Frame(parent)
+        legend.pack(fill="x", pady=(8, 0))
+        ttk.Label(legend, text="Item key:").pack(side="left")
+        self._legend_canvas = tk.Canvas(legend, height=28, highlightthickness=0, background=self._map_canvas["background"])
+        self._legend_canvas.pack(side="left", fill="x", expand=True, padx=(8, 0))
+
+    def _on_view_changed(self, notebook: ttk.Notebook) -> None:
+        tab_text = notebook.tab(notebook.select(), "text")
+        self.view_mode_var.set("map" if tab_text == "Map" else "preview")
+        if self.view_mode_var.get() == "map":
+            self._render_map()
+        else:
+            self._schedule_preview_refresh()
+
+    def _assign_color(self, item_id: str) -> str:
+        if item_id in self.item_colors:
+            return self.item_colors[item_id]
+        palette = [
+            "#8dd3c7",
+            "#ffffb3",
+            "#bebada",
+            "#fb8072",
+            "#80b1d3",
+            "#fdb462",
+            "#b3de69",
+            "#fccde5",
+            "#d9d9d9",
+            "#bc80bd",
+        ]
+        rng = random.Random(hash(item_id) & 0xFFFFFFFF)
+        base_color = rng.choice(palette)
+        self.item_colors[item_id] = base_color
+        return base_color
+
+    def _refresh_item_choices(self) -> None:
+        labels = []
+        self._item_choice_lookup = {}
+        for iid, item in self.items.items():
+            label = f"{Path(item.image_path).name} ({iid})"
+            labels.append(label)
+            self._item_choice_lookup[label] = iid
+            self._assign_color(iid)
+        self.item_choice.configure(values=labels)
+        if labels and self.selected_item_var.get() not in labels:
+            self.selected_item_var.set(labels[0])
+        self._render_item_legend()
+
+    def _render_item_legend(self) -> None:
+        if not hasattr(self, "_legend_canvas"):
+            return
+        canvas: tk.Canvas = self._legend_canvas
+        canvas.delete("all")
+        x = 6
+        y = 4
+        values = self.item_choice.cget("values") or []
+        for label in values:
+            iid = self._item_choice_lookup.get(label)
+            if not iid:
+                continue
+            color = self.item_colors.get(iid, "#ccc")
+            canvas.create_rectangle(x, y, x + 18, y + 18, fill=color, outline="")
+            canvas.create_text(x + 24, y + 9, text=label, anchor="w", fill="#ddd")
+            x += 160
+        canvas.configure(scrollregion=(0, 0, x + 20, 28))
+
+    def _adjust_map_zoom(self, factor: float) -> None:
+        new_zoom = min(6.0, max(0.2, self.map_zoom_var.get() * factor))
+        self.map_zoom_var.set(new_zoom)
+        self._render_map()
+
+    def _map_to_canvas(self, x: float, depth: float) -> tuple[float, float]:
+        scale = self.map_zoom_var.get()
+        return x * scale, depth * scale
+
+    def _map_coords_from_event(self, event: tk.Event) -> tuple[float, float]:
+        if not self._map_canvas:
+            return (0.0, 0.0)
+        scale = self.map_zoom_var.get() or 1.0
+        canvas_x = self._map_canvas.canvasx(event.x)
+        canvas_y = self._map_canvas.canvasy(event.y)
+        return canvas_x / scale, canvas_y / scale
+
+    def _create_map(self) -> None:
+        horizon_distance = max(1.0, self._safe_float(self.distance_to_horizon_var) or 1.0)
+        travel_distance = abs(self._safe_float(self.distance_var) or 0.0)
+        base_width = max(horizon_distance * 1.6, travel_distance * 1.4 + 120.0)
+        self.map_width = base_width
+        self.map_depth = horizon_distance
+        self.map_points = []
+        start_x = base_width / 2
+        end_x = start_x
+        start_depth = 0.0
+        end_depth = 0.0
+        direction = self.direction_var.get()
+        if direction in {"right", "clock-wise"}:
+            end_x = start_x + travel_distance
+        elif direction in {"left", "counter clock-wise"}:
+            end_x = start_x - travel_distance
+        elif direction == "up":
+            end_depth = travel_distance
+        elif direction == "down":
+            end_depth = -travel_distance
+        self.map_camera_start_x = start_x
+        self.map_camera_end_x = end_x
+        self.map_camera_start_depth = start_depth
+        self.map_camera_end_depth = end_depth
+        self._render_map()
+
+    def _auto_generate_map(self) -> None:
+        if not self._map_ready():
+            messagebox.showwarning("Auto generate", "Create a map first so we know its bounds.", parent=self)
+            return
+        rng = random.Random()
+        min_spacing = max(0.0, self.min_separation_var.get())
+        for iid, item in self.items.items():
+            count = max(1, int(round(item.frequency)))
+            for _ in range(count):
+                attempts = 0
+                while attempts < 50:
+                    depth = rng.uniform(item.min_distance, item.max_distance)
+                    x = rng.uniform(0, self.map_width)
+                    if depth > self.map_depth:
+                        depth = self.map_depth
+                    if self._map_point_too_close(x, depth, min_spacing):
+                        attempts += 1
+                        continue
+                    self.map_points.append(MapPoint(item_id=iid, x=x, depth=depth))
+                    break
+        self._render_map()
+
+    def _map_ready(self) -> bool:
+        return self.map_width > 0 and self.map_depth > 0 and self._map_canvas is not None
+
+    def _save_map(self) -> None:  # pragma: no cover - UI callback
+        if not self.map_points:
+            messagebox.showinfo("Save map", "No points to save yet.", parent=self)
+            return
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+            parent=self,
+            title="Save map",
+        )
+        if not file_path:
+            return
+        data = {
+            "map_width": self.map_width,
+            "map_depth": self.map_depth,
+            "points": [
+                {
+                    "item_path": str(self.items[pt.item_id].image_path),
+                    "x": pt.x,
+                    "depth": pt.depth,
+                }
+                for pt in self.map_points
+                if pt.item_id in self.items
+            ],
+        }
+        Path(file_path).write_text(json.dumps(data, indent=2))
+        messagebox.showinfo("Save map", f"Saved {len(data['points'])} points to {file_path}", parent=self)
+
+    def _load_map(self) -> None:  # pragma: no cover - UI callback
+        file_path = filedialog.askopenfilename(
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+            parent=self,
+            title="Load map",
+        )
+        if not file_path:
+            return
+        try:
+            data = json.loads(Path(file_path).read_text())
+        except Exception as exc:
+            messagebox.showerror("Load map", f"Failed to read map: {exc}", parent=self)
+            return
+        self.map_width = float(data.get("map_width", 0.0))
+        self.map_depth = float(data.get("map_depth", 0.0))
+        self.map_points = []
+        for entry in data.get("points", []):
+            path = Path(entry.get("item_path", ""))
+            existing_iid = next((iid for iid, item in self.items.items() if item.image_path == path), None)
+            if existing_iid is None:
+                if path.exists():
+                    self._add_image(path)
+                    existing_iid = next((iid for iid, item in self.items.items() if item.image_path == path), None)
+                else:
+                    continue
+            if existing_iid:
+                self.map_points.append(
+                    MapPoint(item_id=existing_iid, x=float(entry.get("x", 0.0)), depth=float(entry.get("depth", 0.0)))
+                )
+        self._render_map()
+
+    def _map_point_too_close(self, x: float, depth: float, spacing: float) -> bool:
+        for point in self.map_points:
+            if math.hypot(point.x - x, point.depth - depth) < spacing:
+                return True
+        return False
+
+    def _on_map_press(self, event: tk.Event) -> None:  # pragma: no cover - UI callback
+        if not self._map_ready():
+            return
+        self._map_start = self._map_coords_from_event(event)
+        if self._map_canvas:
+            self._map_canvas.delete("preview")
+
+    def _on_map_drag(self, event: tk.Event) -> None:  # pragma: no cover - UI callback
+        if not self._map_ready() or not self._map_start:
+            return
+        current = self._map_coords_from_event(event)
+        if not self._map_canvas:
+            return
+        self._map_canvas.delete("preview")
+        scale = self.map_zoom_var.get()
+        start_canvas = self._map_to_canvas(*self._map_start)
+        current_canvas = self._map_to_canvas(*current)
+        tool = self.draw_tool_var.get()
+        if tool == "line":
+            self._map_canvas.create_line(*start_canvas, *current_canvas, fill="#bbbbbb", dash=(4, 2), tags="preview")
+        elif tool == "square":
+            self._map_canvas.create_rectangle(
+                start_canvas[0],
+                start_canvas[1],
+                current_canvas[0],
+                current_canvas[1],
+                outline="#bbbbbb",
+                dash=(4, 2),
+                tags="preview",
+            )
+        elif tool == "spray":
+            radius = max(6.0, (self.brush_size_var.get() or 0.0) * scale / 2)
+            self._map_canvas.create_oval(
+                current_canvas[0] - radius,
+                current_canvas[1] - radius,
+                current_canvas[0] + radius,
+                current_canvas[1] + radius,
+                outline="#bbbbbb",
+                tags="preview",
+            )
+
+    def _on_map_release(self, event: tk.Event) -> None:  # pragma: no cover - UI callback
+        if not self._map_ready() or self._map_start is None:
+            return
+        end = self._map_coords_from_event(event)
+        start = self._map_start
+        self._map_start = None
+        if self._map_canvas:
+            self._map_canvas.delete("preview")
+        self._apply_draw_tool(start, end)
+
+    def _resolve_selected_item_id(self) -> Optional[str]:
+        label = self.selected_item_var.get()
+        if label in self._item_choice_lookup:
+            return self._item_choice_lookup[label]
+        if label in self.items:
+            return label
+        return None
+
+    def _apply_draw_tool(self, start: tuple[float, float], end: tuple[float, float]) -> None:
+        item_id = self._resolve_selected_item_id()
+        if not item_id:
+            messagebox.showwarning("Map", "Select an item to place on the map first.", parent=self)
+            return
+        if not self._map_ready():
+            return
+        density = max(0.1, float(self.density_var.get()))
+        conformity = min(1.0, max(0.0, float(self.conformity_var.get())))
+        spacing = max(0.0, float(self.min_separation_var.get()))
+        brush = max(4.0, float(self.brush_size_var.get()))
+        tool = self.draw_tool_var.get()
+
+        def add_point(x: float, depth: float) -> None:
+            x = min(max(0.0, x), self.map_width)
+            depth = min(max(0.0, depth), self.map_depth)
+            if not self._map_point_too_close(x, depth, spacing):
+                self.map_points.append(MapPoint(item_id=item_id, x=x, depth=depth))
+
+        if tool == "single":
+            add_point(*end)
+        elif tool == "spray":
+            cx, cy = end
+            radius = brush / 2
+            area = math.pi * radius * radius
+            count = max(1, int(area / 800.0 * density))
+            rng = random.Random()
+            for _ in range(count):
+                angle = rng.random() * math.tau
+                dist = radius * math.pow(rng.random(), conformity)
+                px = cx + math.cos(angle) * dist
+                py = cy + math.sin(angle) * dist
+                add_point(px, py)
+        elif tool == "line":
+            sx, sy = start
+            ex, ey = end
+            length = max(1e-3, math.hypot(ex - sx, ey - sy))
+            step = max(6.0, (50.0 / density))
+            count = max(2, int(length / step))
+            for idx in range(count + 1):
+                t = idx / max(count, 1)
+                px = sx + (ex - sx) * t
+                py = sy + (ey - sy) * t
+                jitter = (1 - conformity) * brush * 0.1
+                if jitter:
+                    px += random.uniform(-jitter, jitter)
+                    py += random.uniform(-jitter, jitter)
+                add_point(px, py)
+        elif tool == "square":
+            min_x, max_x = sorted([start[0], end[0]])
+            min_y, max_y = sorted([start[1], end[1]])
+            width = max(1.0, max_x - min_x)
+            height = max(1.0, max_y - min_y)
+            spacing_step = max(10.0, 80.0 / density)
+            jitter = (1 - conformity) * spacing_step * 0.5
+            y = min_y
+            while y <= max_y:
+                x = min_x
+                while x <= max_x:
+                    px = x + random.uniform(-jitter, jitter)
+                    py = y + random.uniform(-jitter, jitter)
+                    add_point(px, py)
+                    x += spacing_step
+                y += spacing_step
+        self._render_map()
+
+    def _render_map(self) -> None:
+        if not self._map_canvas:
+            return
+        canvas = self._map_canvas
+        canvas.delete("all")
+        if self.map_width <= 0 or self.map_depth <= 0:
+            canvas.create_text(10, 10, text="Click 'Create map' to size the map.", anchor="nw", fill="#b0b0b0")
+            return
+        scale = self.map_zoom_var.get()
+        canvas.configure(scrollregion=(0, 0, self.map_width * scale, self.map_depth * scale))
+        canvas.create_rectangle(0, 0, self.map_width * scale, self.map_depth * scale, fill="#0a0a0a", outline="#222")
+        def to_canvas(pt: tuple[float, float]) -> tuple[float, float]:
+            return self._map_to_canvas(pt[0], pt[1])
+
+        fov_value = self._safe_float(self.field_of_view_var) or 60.0
+        base_width = max(40.0, math.tan(math.radians(max(10.0, fov_value / 2))) * self.map_depth)
+        start = (self.map_camera_start_x, max(0.0, self.map_camera_start_depth))
+        end = (self.map_camera_end_x, max(0.0, self.map_camera_end_depth))
+        start_canvas = to_canvas(start)
+        end_canvas = to_canvas(end)
+        triangle_color = "#f2e55ca0"
+        end_color = "#fff7b54a"
+        canvas.create_polygon(
+            start_canvas[0],
+            start_canvas[1],
+            start_canvas[0] - base_width * 0.5 * scale,
+            self.map_depth * scale,
+            start_canvas[0] + base_width * 0.5 * scale,
+            self.map_depth * scale,
+            fill=triangle_color,
+            outline="",
+        )
+        canvas.create_polygon(
+            end_canvas[0],
+            end_canvas[1],
+            end_canvas[0] - base_width * 0.5 * scale,
+            self.map_depth * scale,
+            end_canvas[0] + base_width * 0.5 * scale,
+            self.map_depth * scale,
+            fill=end_color,
+            outline="",
+        )
+        canvas.create_line(start_canvas[0], start_canvas[1], end_canvas[0], end_canvas[1], fill="#f8f3c560", dash=(3, 2))
+        canvas.create_line(
+            start_canvas[0] - base_width * 0.5 * scale,
+            self.map_depth * scale,
+            end_canvas[0] - base_width * 0.5 * scale,
+            self.map_depth * scale,
+            fill="#f8f3c560",
+            dash=(3, 2),
+        )
+        canvas.create_line(
+            start_canvas[0] + base_width * 0.5 * scale,
+            self.map_depth * scale,
+            end_canvas[0] + base_width * 0.5 * scale,
+            self.map_depth * scale,
+            fill="#f8f3c560",
+            dash=(3, 2),
+        )
+
+        for point in self.map_points:
+            color = self.item_colors.get(point.item_id, "#cccccc")
+            cx, cy = to_canvas((point.x, point.depth))
+            radius = max(4.0, 7.0 * scale * 0.6)
+            canvas.create_oval(cx - radius, cy - radius, cx + radius, cy + radius, fill=color, outline="#111")
+        self._render_item_legend()
 
     # ------------------------------------------------------------------
     def _build_render_controls(self, container: ttk.Frame) -> None:
@@ -636,6 +1130,9 @@ class ParallaxPlaygroundApp(BaseTkClass):
         iid = self.tree.insert("", "end", values=item.as_row())
         self.items[iid] = item
         self.tree.selection_set(iid)
+        self._assign_color(iid)
+        self._refresh_item_choices()
+        self._render_map()
 
     # ------------------------------------------------------------------
     def _start_edit(self, event: tk.Event) -> None:  # pragma: no cover - UI callback
@@ -792,8 +1289,14 @@ class ParallaxPlaygroundApp(BaseTkClass):
             messagebox.showerror("Render animation", f"Failed to load images: {exc}", parent=self)
             return
 
+        use_map = bool(self.map_points)
+        if use_map and self.map_width <= 0:
+            self.map_width = max(horizon_distance * 1.6, abs(distance) + horizon_distance)
+        if use_map and self.map_depth <= 0:
+            self.map_depth = horizon_distance
+
         placed_active: list[ActiveInstance] = []
-        if self.placed_items:
+        if not use_map and self.placed_items:
             for placed in self.placed_items:
                 if placed.item_id not in loaded_items:
                     continue
@@ -824,21 +1327,22 @@ class ParallaxPlaygroundApp(BaseTkClass):
         def parallax_factor(depth: float) -> float:
             return 0.6 + (horizon_distance / (depth + 1e-3)) * 0.2
 
-        for iid, (item, _image) in loaded_items.items():
-            count = max(0, int(round(item.frequency)))
-            if count == 0:
-                continue
-            lateral_offset_range = self.render_settings.height * 0.12
-            for idx in range(count):
-                depth = foreground_cutoff + rng.uniform(
-                    max(0.01, item.min_distance), max(0.02, item.max_distance)
-                )
-                landscape_width = geometry.landscape_width_at_depth(depth)
-                segment = landscape_width / count
-                x_world = idx * segment + rng.uniform(0, segment)
-                x_pos = (self.render_settings.width / 2) + (x_world - landscape_width / 2)
-                lateral_offset = rng.uniform(-lateral_offset_range, lateral_offset_range)
-                active.append(ActiveInstance(item_id=iid, depth=depth, x=x_pos, lateral_offset=lateral_offset))
+        if not use_map:
+            for iid, (item, _image) in loaded_items.items():
+                count = max(0, int(round(item.frequency)))
+                if count == 0:
+                    continue
+                lateral_offset_range = self.render_settings.height * 0.12
+                for idx in range(count):
+                    depth = foreground_cutoff + rng.uniform(
+                        max(0.01, item.min_distance), max(0.02, item.max_distance)
+                    )
+                    landscape_width = geometry.landscape_width_at_depth(depth)
+                    segment = landscape_width / count
+                    x_world = idx * segment + rng.uniform(0, segment)
+                    x_pos = (self.render_settings.width / 2) + (x_world - landscape_width / 2)
+                    lateral_offset = rng.uniform(-lateral_offset_range, lateral_offset_range)
+                    active.append(ActiveInstance(item_id=iid, depth=depth, x=x_pos, lateral_offset=lateral_offset))
 
         progress_interval = max(1, total_frames // 20)
         horizon_x = self.render_settings.width / 2
@@ -846,26 +1350,45 @@ class ParallaxPlaygroundApp(BaseTkClass):
         depth_step = max(0.5, self._safe_float(self.grid_depth_spacing_var) or 10.0)
         grid_alpha_color = (*grid_color_rgb, 140)
         for frame_idx in range(total_frames):
-            updated_active: list[ActiveInstance] = []
-            for instance in active:
-                if forward_motion:
-                    instance.depth -= delta_depth
-                    if instance.depth <= foreground_cutoff:
+            progress = frame_idx / max(total_frames - 1, 1)
+            if use_map:
+                frame_active: list[ActiveInstance] = []
+                camera_x = self.map_camera_start_x + (self.map_camera_end_x - self.map_camera_start_x) * progress
+                camera_depth = self.map_camera_start_depth + (self.map_camera_end_depth - self.map_camera_start_depth) * progress
+                for point in self.map_points:
+                    if point.item_id not in loaded_items:
                         continue
-                elif backward_motion:
-                    instance.depth += delta_depth
-                    if instance.depth >= horizon_distance + fog_depth:
+                    relative_depth = point.depth - camera_depth
+                    if relative_depth <= foreground_cutoff or relative_depth >= horizon_distance + fog_depth:
                         continue
-                elif sideways_motion:
-                    factor = parallax_factor(instance.depth)
-                    instance.x += horizontal_sign * speed * delta_time * factor
-                    if instance.x < -parallax_margin or instance.x > self.render_settings.width + parallax_margin:
-                        continue
-                elif rotational_motion:
-                    factor = parallax_factor(instance.depth)
-                    instance.x += horizontal_sign * speed * delta_time * factor * 0.6
-                updated_active.append(instance)
-            active = updated_active
+                    visible_width = geometry.landscape_width_at_depth(relative_depth)
+                    x_offset = point.x - camera_x
+                    x_pos = (self.render_settings.width / 2) + (x_offset / max(self.map_width, 1e-3)) * visible_width
+                    frame_active.append(
+                        ActiveInstance(item_id=point.item_id, depth=relative_depth, x=x_pos, lateral_offset=0.0)
+                    )
+            else:
+                updated_active: list[ActiveInstance] = []
+                for instance in active:
+                    if forward_motion:
+                        instance.depth -= delta_depth
+                        if instance.depth <= foreground_cutoff:
+                            continue
+                    elif backward_motion:
+                        instance.depth += delta_depth
+                        if instance.depth >= horizon_distance + fog_depth:
+                            continue
+                    elif sideways_motion:
+                        factor = parallax_factor(instance.depth)
+                        instance.x += horizontal_sign * speed * delta_time * factor
+                        if instance.x < -parallax_margin or instance.x > self.render_settings.width + parallax_margin:
+                            continue
+                    elif rotational_motion:
+                        factor = parallax_factor(instance.depth)
+                        instance.x += horizontal_sign * speed * delta_time * factor * 0.6
+                    updated_active.append(instance)
+                active = updated_active
+                frame_active = active
 
             frame = Image.new("RGBA", (self.render_settings.width, self.render_settings.height), "black")
             if grid_enabled:
@@ -888,7 +1411,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
                     draw.line([(0, y), (self.render_settings.width, y)], fill=grid_alpha_color, width=1)
                     depth += depth_step
                 draw.line([(0, horizon_y), (self.render_settings.width, horizon_y)], fill=grid_alpha_color, width=1)
-            draw_list = sorted(active, key=lambda inst: inst.depth, reverse=True)
+            draw_list = sorted(frame_active, key=lambda inst: inst.depth, reverse=True)
             draw_context: Optional[ImageDraw.ImageDraw] = draw if grid_enabled else None
             for inst in draw_list:
                 item, image = loaded_items[inst.item_id]

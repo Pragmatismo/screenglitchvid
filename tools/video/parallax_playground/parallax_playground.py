@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -667,11 +669,13 @@ class ParallaxPlaygroundApp(BaseTkClass):
         camera_x: float,
         camera_depth: float,
         field_of_view: float,
+        map_grid_lines: Optional[list[tuple[tuple[float, float], tuple[float, float]]]] = None,
     ) -> list[tuple[tuple[float, float], tuple[float, float]]]:
-        if not self.map_grid_lines:
+        grid_lines = map_grid_lines if map_grid_lines is not None else self.map_grid_lines
+        if not grid_lines:
             return []
         projected = []
-        for start, end in self.map_grid_lines:
+        for start, end in grid_lines:
             p1 = self._project_map_point(
                 start,
                 geometry=geometry,
@@ -1590,6 +1594,8 @@ class ParallaxPlaygroundApp(BaseTkClass):
 
         grid_vertical_spacing = max(8.0, self._safe_float(self.grid_vertical_spacing_var) or (self.render_settings.width / 10))
         depth_step = max(0.5, self._safe_float(self.grid_depth_spacing_var) or 10.0)
+        self._update_map_grid_lines()
+        map_grid_lines = list(self.map_grid_lines)
 
         frame = self._compose_render_frame(
             frame_number - 1,
@@ -1605,6 +1611,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
             fog_depth=params["fog_depth"],
             foreground_cutoff=params["foreground_cutoff"],
             field_of_view=params["field_of_view"],
+            map_grid_lines=map_grid_lines,
         )
 
         self._display_scaled_preview(frame)
@@ -1755,6 +1762,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
         fog_depth: float,
         foreground_cutoff: float,
         field_of_view: float,
+        map_grid_lines: Optional[list[tuple[tuple[float, float], tuple[float, float]]]] = None,
     ) -> Image.Image:
         fog_start = max(0.0, geometry.draw_distance - fog_depth)
         horizon_y = geometry.horizon_y()
@@ -1797,7 +1805,6 @@ class ParallaxPlaygroundApp(BaseTkClass):
                 )
             )
 
-        self._update_map_grid_lines()
         frame = Image.new("RGBA", (geometry.width, geometry.height), "black")
         ground_layer = self._build_ground_layer(
             geometry,
@@ -1817,6 +1824,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
                 camera_x=camera_x,
                 camera_depth=camera_depth,
                 field_of_view=field_of_view,
+                map_grid_lines=map_grid_lines,
             )
             if projected_lines:
                 for start, end in projected_lines:
@@ -1938,8 +1946,11 @@ class ParallaxPlaygroundApp(BaseTkClass):
         progress_interval = max(1, total_frames // 20)
         grid_vertical_spacing = max(8.0, self._safe_float(self.grid_vertical_spacing_var) or (self.render_settings.width / 10))
         depth_step = max(0.5, self._safe_float(self.grid_depth_spacing_var) or 10.0)
+        self._update_map_grid_lines()
+        map_grid_lines = list(self.map_grid_lines)
+        render_workers = min(8, max(1, os.cpu_count() or 4))
 
-        for frame_idx in range(total_frames):
+        def render_frame(frame_idx: int) -> tuple[int, Optional[np.ndarray]]:
             frame = self._compose_render_frame(
                 frame_idx,
                 total_frames,
@@ -1954,22 +1965,33 @@ class ParallaxPlaygroundApp(BaseTkClass):
                 fog_depth=params["fog_depth"],
                 foreground_cutoff=params["foreground_cutoff"],
                 field_of_view=params["field_of_view"],
+                map_grid_lines=map_grid_lines,
             )
 
             if start_frame - 1 <= frame_idx <= end_frame - 1:
                 frame_rgb = frame.convert("RGB")
                 imageio_frame = np.array(frame_rgb)
-                if writer is None:
-                    writer = imageio.get_writer(
-                        output_path,
-                        fps=fps,
-                        codec=self.render_settings.codec,
-                        quality=8,
-                    )
-                writer.append_data(imageio_frame)
+            else:
+                imageio_frame = None
+            return frame_idx, imageio_frame
 
-            if frame_idx % progress_interval == 0 or frame_idx == total_frames - 1:
-                print(f"Rendering frame {frame_idx + 1}/{total_frames}...", flush=True)
+        with ThreadPoolExecutor(max_workers=render_workers) as executor:
+            for frame_idx, imageio_frame in executor.map(render_frame, range(total_frames)):
+                if imageio_frame is not None:
+                    if writer is None:
+                        writer = imageio.get_writer(
+                            output_path,
+                            fps=fps,
+                            codec=self.render_settings.codec,
+                            quality=8,
+                        )
+                    writer.append_data(imageio_frame)
+
+                if frame_idx % progress_interval == 0 or frame_idx == total_frames - 1:
+                    print(
+                        f"Rendering frame {frame_idx + 1}/{total_frames}... (workers={render_workers})",
+                        flush=True,
+                    )
 
         if writer is not None:
             writer.close()

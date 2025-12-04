@@ -218,6 +218,8 @@ class ParallaxPlaygroundApp(BaseTkClass):
         self.min_separation_var = tk.DoubleVar(value=18.0)
         self.draw_tool_var = tk.StringVar(value="single")
         self.selected_item_var = tk.StringVar()
+        self.preview_frame_var = tk.IntVar(value=1)
+        self.preview_frame_label_var = tk.StringVar(value="Frame: –")
         self.render_settings = RenderSettings()
         self.last_render_path: Optional[Path] = None
         self._preview_after_id: Optional[str] = None
@@ -226,6 +228,9 @@ class ParallaxPlaygroundApp(BaseTkClass):
         self._map_canvas: Optional[tk.Canvas] = None
         self._map_image_id: Optional[int] = None
         self._map_start: Optional[tuple[float, float]] = None
+        self._total_frames: int = 1
+        self._render_start_frame: int = 1
+        self._render_end_frame: int = 1
 
         self._build_ui()
         self._configure_drop()
@@ -447,11 +452,26 @@ class ParallaxPlaygroundApp(BaseTkClass):
         self.preview_distance_label.pack(side="left", padx=(0, 8))
         ttk.Button(controls, text="Place items", command=self._preview_place_items).pack(side="left")
 
+        frame_controls = ttk.Frame(parent)
+        frame_controls.pack(fill="x", pady=(0, 8))
+        ttk.Label(frame_controls, text="Frame").pack(side="left")
+        self.preview_frame_scale = ttk.Scale(
+            frame_controls,
+            variable=self.preview_frame_var,
+            from_=1,
+            to=1,
+            command=lambda _evt=None: self._update_frame_selection_label(),
+        )
+        self.preview_frame_scale.pack(side="left", fill="x", expand=True, padx=8)
+        ttk.Label(frame_controls, textvariable=self.preview_frame_label_var).pack(side="left", padx=(0, 8))
+        ttk.Button(frame_controls, text="Draw frame", command=self._draw_frame_preview).pack(side="left")
+
         canvas_frame = ttk.Frame(parent)
         canvas_frame.pack(fill="both", expand=True)
         self.preview_canvas = tk.Canvas(canvas_frame, width=780, height=260, highlightthickness=1, highlightbackground="#333")
         self.preview_canvas.pack(fill="both", expand=True)
         self._update_preview_distance_label()
+        self._update_duration()
         self._schedule_preview_refresh()
 
     def _build_map_tab(self, parent: ttk.Frame) -> None:
@@ -640,6 +660,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
         self.map_camera_start_depth = start_depth
         self.map_camera_end_depth = end_depth
         self._render_map()
+        self._update_duration()
 
     def _auto_generate_map(self) -> None:
         if not self._map_ready():
@@ -724,6 +745,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
                     MapPoint(item_id=existing_iid, x=float(entry.get("x", 0.0)), depth=float(entry.get("depth", 0.0)))
                 )
         self._render_map()
+        self._update_duration()
 
     def _map_point_too_close(self, x: float, depth: float, spacing: float) -> bool:
         for point in self.map_points:
@@ -962,20 +984,139 @@ class ParallaxPlaygroundApp(BaseTkClass):
             return None
 
     # ------------------------------------------------------------------
+    def _collect_render_parameters(self, *, context: str) -> Optional[dict]:
+        distance = self._safe_float(self.distance_var)
+        rate = self._safe_float(self.rate_var)
+        horizon_height = self._safe_float(self.horizon_height_var)
+        horizon_distance = self._safe_float(self.distance_to_horizon_var)
+        field_of_view = self._safe_float(self.field_of_view_var)
+        fog_amount = self._safe_float(self.horizon_fog_var)
+        fog_depth = self._safe_float(self.horizon_fog_depth_var)
+        foreground_cutoff = self._safe_float(self.foreground_cutoff_var)
+        grid_enabled = bool(self.grid_enabled_var.get())
+        grid_color_raw = self.grid_color_var.get().strip() or "#0b3d0b"
+        grid_background_raw = self.grid_background_color_var.get().strip() or "#050505"
+
+        if None in {
+            distance,
+            rate,
+            horizon_height,
+            horizon_distance,
+            fog_amount,
+            fog_depth,
+            foreground_cutoff,
+            field_of_view,
+        }:
+            messagebox.showerror(context, "Please enter numeric animation settings before rendering.", parent=self)
+            return None
+        assert distance is not None and rate is not None
+        assert horizon_height is not None and horizon_distance is not None and field_of_view is not None
+        assert fog_amount is not None and fog_depth is not None and foreground_cutoff is not None
+
+        if rate == 0:
+            messagebox.showerror(context, "Rate of travel must be non-zero.", parent=self)
+            return None
+        if horizon_distance <= 0:
+            messagebox.showerror(context, "Distance to horizon must be greater than zero.", parent=self)
+            return None
+        if not 0 <= horizon_height <= 1:
+            messagebox.showerror(context, "Horizon height must be between 0 and 1.", parent=self)
+            return None
+
+        return {
+            "distance": distance,
+            "rate": rate,
+            "horizon_height": horizon_height,
+            "horizon_distance": horizon_distance,
+            "field_of_view": field_of_view,
+            "fog_amount": fog_amount,
+            "fog_depth": fog_depth,
+            "foreground_cutoff": foreground_cutoff,
+            "grid_enabled": grid_enabled,
+            "grid_color_raw": grid_color_raw,
+            "grid_background_raw": grid_background_raw,
+        }
+
+    # ------------------------------------------------------------------
+    def _load_render_images(
+        self, items: list[tuple[str, ParallaxItem]], *, context: str
+    ) -> Optional[Dict[str, tuple[ParallaxItem, Image.Image]]]:
+        try:
+            return {iid: (item, Image.open(item.image_path).convert("RGBA")) for iid, item in items}
+        except FileNotFoundError:
+            messagebox.showerror(context, "One or more image paths are missing.", parent=self)
+            return None
+        except Exception as exc:  # pragma: no cover - runtime guard for unexpected image errors
+            messagebox.showerror(context, f"Failed to load images: {exc}", parent=self)
+            return None
+
+    # ------------------------------------------------------------------
+    def _update_frame_selection_label(self) -> None:
+        if not hasattr(self, "preview_frame_scale"):
+            return
+        try:
+            value = int(self.preview_frame_var.get())
+        except (tk.TclError, ValueError):
+            value = 1
+        value = min(max(value, 1), max(1, self._total_frames))
+        self.preview_frame_var.set(value)
+        range_text = f"rendering {self._render_start_frame}-{self._render_end_frame}"
+        self.preview_frame_label_var.set(f"Frame: {value}/{self._total_frames} ({range_text})")
+
+    # ------------------------------------------------------------------
+    def _sync_frame_controls(self, total_frames: Optional[int], start_frame: int = 1, end_frame: int = 1) -> None:
+        if not hasattr(self, "preview_frame_scale"):
+            return
+        if total_frames is None or total_frames <= 0:
+            self._total_frames = 1
+            self._render_start_frame = 1
+            self._render_end_frame = 1
+            self.preview_frame_scale.configure(from_=1, to=1)
+            self.preview_frame_var.set(1)
+            self.preview_frame_label_var.set("Frame: –")
+            return
+        self._total_frames = total_frames
+        self._render_start_frame = start_frame
+        self._render_end_frame = end_frame
+        self.preview_frame_scale.configure(from_=1, to=self._total_frames)
+        self._update_frame_selection_label()
+
+    # ------------------------------------------------------------------
     def _update_duration(self) -> None:
         distance = self._safe_float(self.distance_var)
         rate = self._safe_float(self.rate_var)
+        fps = max(0, int(self.render_settings.fps))
 
         if distance is None or rate is None:
             self.duration_var.set("Duration: – (enter numeric values)")
+            self._sync_frame_controls(None)
             return
 
         if rate == 0:
             self.duration_var.set("Duration: ∞ (rate must be non-zero)")
+            self._sync_frame_controls(None)
             return
 
-        duration = distance / rate
-        self.duration_var.set(f"Duration: {duration:.2f} time units")
+        if fps <= 0:
+            self.duration_var.set("Duration: – (FPS must be positive)")
+            self._sync_frame_controls(None)
+            return
+
+        map_travel = math.hypot(
+            self.map_camera_end_x - self.map_camera_start_x,
+            self.map_camera_end_depth - self.map_camera_start_depth,
+        )
+        duration = max(map_travel, abs(distance)) / abs(rate)
+        total_frames = max(1, math.ceil(duration * fps))
+        start_frame = max(1, self.render_settings.start_frame or 1)
+        end_frame = min(self.render_settings.end_frame or total_frames, total_frames)
+        range_text = ""
+        if start_frame != 1 or end_frame != total_frames:
+            range_text = f" Rendering frames {start_frame}-{end_frame}."
+        self.duration_var.set(
+            f"Duration: {duration:.2f}s @ {fps} fps ({total_frames} frames).{range_text}"
+        )
+        self._sync_frame_controls(total_frames, start_frame, end_frame)
 
     # ------------------------------------------------------------------
     def _update_preview_distance_label(self) -> None:
@@ -1113,6 +1254,112 @@ class ParallaxPlaygroundApp(BaseTkClass):
         self._render_preview_background(include_items=True, record_positions=True)
 
     # ------------------------------------------------------------------
+    def _display_scaled_preview(self, frame: Image.Image) -> None:
+        if self._preview_after_id is not None:
+            try:
+                self.after_cancel(self._preview_after_id)
+            except Exception:
+                pass
+            self._preview_after_id = None
+
+        canvas_width = max(int(self.preview_canvas.winfo_width()) or 0, 780)
+        canvas_height = max(int(self.preview_canvas.winfo_height()) or 0, 260)
+        scale = min(canvas_width / max(frame.width, 1), canvas_height / max(frame.height, 1), 1.0)
+        target_size = (
+            max(1, int(frame.width * scale)),
+            max(1, int(frame.height * scale)),
+        )
+        resized = frame.resize(target_size, RESAMPLE)
+        composed = Image.new("RGBA", (canvas_width, canvas_height), "#0a0a0a")
+        offset = ((canvas_width - target_size[0]) // 2, (canvas_height - target_size[1]) // 2)
+        composed.paste(resized, offset)
+
+        self._preview_image = composed
+        self._preview_photo = ImageTk.PhotoImage(composed)
+        self.preview_canvas.delete("all")
+        self.preview_canvas.create_image(0, 0, anchor="nw", image=self._preview_photo)
+
+    # ------------------------------------------------------------------
+    def _draw_frame_preview(self) -> None:  # pragma: no cover - UI callback
+        if not self.items:
+            messagebox.showwarning("Preview frame", "Add at least one image before previewing.", parent=self)
+            return
+        if not self.map_points or not self._map_ready():
+            messagebox.showwarning(
+                "Preview frame",
+                "Use the Map tab to lay out items and define a camera path before previewing.",
+                parent=self,
+            )
+            return
+
+        params = self._collect_render_parameters(context="Preview frame")
+        if params is None:
+            return
+
+        fps = max(1, int(self.render_settings.fps))
+        speed = abs(params["rate"])
+        map_travel = math.hypot(
+            self.map_camera_end_x - self.map_camera_start_x,
+            self.map_camera_end_depth - self.map_camera_start_depth,
+        )
+        duration = max(map_travel, abs(params["distance"])) / max(speed, 1e-6)
+        total_frames = max(1, math.ceil(duration * fps))
+        start_frame = max(1, self.render_settings.start_frame or 1)
+        end_frame = min(self.render_settings.end_frame or total_frames, total_frames)
+
+        self._sync_frame_controls(total_frames, start_frame, end_frame)
+        try:
+            frame_number = int(self.preview_frame_var.get())
+        except (tk.TclError, ValueError):
+            frame_number = 1
+        frame_number = min(max(frame_number, 1), total_frames)
+        self.preview_frame_var.set(frame_number)
+        self._update_frame_selection_label()
+
+        geometry = PerspectiveMath(
+            width=self.render_settings.width,
+            height=self.render_settings.height,
+            horizon_height=params["horizon_height"],
+            horizon_distance=params["horizon_distance"],
+            field_of_view=params["field_of_view"],
+            foreground_cutoff=params["foreground_cutoff"],
+        )
+
+        loaded_items = self._load_render_images(list(self.items.items()), context="Preview frame")
+        if loaded_items is None:
+            return
+
+        try:
+            grid_color_rgb = ImageColor.getrgb(params["grid_color_raw"])
+        except ValueError:
+            grid_color_rgb = ImageColor.getrgb("#0b3d0b")
+        try:
+            background_rgb = ImageColor.getrgb(params["grid_background_raw"])
+        except ValueError:
+            background_rgb = ImageColor.getrgb("#050505")
+
+        grid_vertical_spacing = max(8.0, self._safe_float(self.grid_vertical_spacing_var) or (self.render_settings.width / 10))
+        depth_step = max(0.5, self._safe_float(self.grid_depth_spacing_var) or 10.0)
+
+        frame = self._compose_render_frame(
+            frame_number - 1,
+            total_frames,
+            geometry,
+            loaded_items,
+            grid_enabled=params["grid_enabled"],
+            grid_color_rgb=grid_color_rgb,
+            grid_background_rgb=background_rgb,
+            grid_vertical_spacing=grid_vertical_spacing,
+            depth_step=depth_step,
+            fog_amount=params["fog_amount"],
+            fog_depth=params["fog_depth"],
+            foreground_cutoff=params["foreground_cutoff"],
+            field_of_view=params["field_of_view"],
+        )
+
+        self._display_scaled_preview(frame)
+
+    # ------------------------------------------------------------------
     def _handle_drop(self, event: tk.Event) -> None:  # pragma: no cover - UI callback
         paths = self.tk.splitlist(event.data) if event.data else []
         if not paths:
@@ -1239,6 +1486,126 @@ class ParallaxPlaygroundApp(BaseTkClass):
                 ),
                 parent=self,
             )
+            self._update_duration()
+
+    # ------------------------------------------------------------------
+    def _compose_render_frame(
+        self,
+        frame_idx: int,
+        total_frames: int,
+        geometry: PerspectiveMath,
+        loaded_items: Dict[str, tuple[ParallaxItem, Image.Image]],
+        *,
+        grid_enabled: bool,
+        grid_color_rgb: tuple[int, int, int],
+        grid_background_rgb: tuple[int, int, int],
+        grid_vertical_spacing: float,
+        depth_step: float,
+        fog_amount: float,
+        fog_depth: float,
+        foreground_cutoff: float,
+        field_of_view: float,
+    ) -> Image.Image:
+        fog_start = max(0.0, geometry.horizon_distance - fog_depth)
+        horizon_y = geometry.horizon_y()
+        horizon_x = geometry.width / 2
+        grid_alpha_color = (*grid_color_rgb, 140)
+
+        def fog_multiplier(depth: float) -> float:
+            if depth <= fog_start:
+                return 1.0
+            fog_ratio = min(1.0, (depth - fog_start) / max(fog_depth, 1e-3))
+            return 1.0 - fog_ratio * fog_amount
+
+        camera_start_x = self.map_camera_start_x or (self.map_width / 2)
+        camera_end_x = self.map_camera_end_x or camera_start_x
+        camera_start_depth = self.map_camera_start_depth
+        camera_end_depth = self.map_camera_end_depth
+
+        progress = frame_idx / max(total_frames - 1, 1)
+        camera_x = camera_start_x + (camera_end_x - camera_start_x) * progress
+        camera_depth = camera_start_depth + (camera_end_depth - camera_start_depth) * progress
+
+        frame_active: list[ActiveInstance] = []
+        for point in self.map_points:
+            if point.item_id not in loaded_items:
+                continue
+            relative_depth = point.depth - camera_depth
+            if relative_depth <= foreground_cutoff or relative_depth >= geometry.horizon_distance + fog_depth:
+                continue
+            visible_width = self._view_width_at_distance(relative_depth, field_of_view)
+            x_offset = point.x - camera_x
+            normalized = x_offset / max(visible_width / 2, 1e-6)
+            screen_x = (geometry.width / 2) + normalized * (geometry.width / 2)
+            frame_active.append(
+                ActiveInstance(
+                    item_id=point.item_id,
+                    depth=relative_depth,
+                    x=screen_x,
+                    lateral_offset=0.0,
+                    landscape_fraction=0.5,
+                )
+            )
+
+        frame = Image.new("RGBA", (geometry.width, geometry.height), "black")
+        draw: Optional[ImageDraw.ImageDraw] = None
+        if grid_enabled:
+            draw = ImageDraw.Draw(frame, "RGBA")
+            draw.rectangle([(0, horizon_y), (geometry.width, geometry.height)], fill=grid_background_rgb)
+            x = 0.0
+            while x <= geometry.width + 1:
+                draw.line([(x, geometry.height), (horizon_x, horizon_y)], fill=grid_alpha_color, width=1)
+                x += grid_vertical_spacing
+
+            depth = foreground_cutoff
+            while depth <= geometry.horizon_distance:
+                y = geometry.depth_to_screen_y(depth)
+                if y < horizon_y:
+                    break
+                draw.line([(0, y), (geometry.width, y)], fill=grid_alpha_color, width=1)
+                depth += depth_step
+            draw.line([(0, horizon_y), (geometry.width, horizon_y)], fill=grid_alpha_color, width=1)
+
+        draw_list = sorted(frame_active, key=lambda inst: inst.depth, reverse=True)
+        draw_context: Optional[ImageDraw.ImageDraw] = draw if grid_enabled else None
+        for inst in draw_list:
+            item, image = loaded_items[inst.item_id]
+            scale = geometry.projected_scale(inst.depth) * max(item.scale, 0.0)
+            target_w = max(1, int(image.width * scale))
+            target_h = max(1, int(image.height * scale))
+            ground_y = geometry.depth_to_screen_y(inst.depth) + inst.lateral_offset
+            top_y = ground_y - target_h
+            top_y = max(-target_h, min(geometry.height + target_h, top_y))
+            alpha = fog_multiplier(inst.depth)
+            bbox = (
+                inst.x - target_w / 2,
+                top_y,
+                inst.x + target_w / 2,
+                top_y + target_h,
+            )
+            if bbox[2] < 0 or bbox[0] > geometry.width:
+                continue
+            if bbox[3] < 0 or bbox[1] > geometry.height:
+                continue
+            if target_w < 4 or target_h < 4:
+                if draw_context is None:
+                    draw_context = ImageDraw.Draw(frame, "RGBA")
+                alpha_int = int(alpha * 255)
+                shade = (40, 40, 40, alpha_int)
+                draw_context.rectangle(
+                    [(int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3]))],
+                    fill=shade,
+                )
+                continue
+            scaled = image.resize((target_w, target_h), RESAMPLE)
+            if alpha < 1.0:
+                alpha_layer = scaled.split()[3].point(lambda a: int(a * alpha))
+                scaled.putalpha(alpha_layer)
+            frame.alpha_composite(
+                scaled,
+                (int(inst.x - target_w / 2), int(top_y)),
+            )
+        return frame
 
     # ------------------------------------------------------------------
     def _render_animation(self) -> None:  # pragma: no cover - UI callback
@@ -1253,52 +1620,17 @@ class ParallaxPlaygroundApp(BaseTkClass):
                 parent=self,
             )
             return
-
-        distance = self._safe_float(self.distance_var)
-        rate = self._safe_float(self.rate_var)
-        horizon_height = self._safe_float(self.horizon_height_var)
-        horizon_distance = self._safe_float(self.distance_to_horizon_var)
-        field_of_view = self._safe_float(self.field_of_view_var)
-        fog_amount = self._safe_float(self.horizon_fog_var)
-        fog_depth = self._safe_float(self.horizon_fog_depth_var)
-        foreground_cutoff = self._safe_float(self.foreground_cutoff_var)
-        grid_enabled = bool(self.grid_enabled_var.get())
-        grid_color_raw = self.grid_color_var.get().strip() or "#0b3d0b"
-        grid_background_raw = self.grid_background_color_var.get().strip() or "#050505"
-
-        if None in {
-            distance,
-            rate,
-            horizon_height,
-            horizon_distance,
-            fog_amount,
-            fog_depth,
-            foreground_cutoff,
-            field_of_view,
-        }:
-            messagebox.showerror("Render animation", "Please enter numeric animation settings before rendering.", parent=self)
-            return
-        assert distance is not None and rate is not None
-        assert horizon_height is not None and horizon_distance is not None and field_of_view is not None
-        assert fog_amount is not None and fog_depth is not None and foreground_cutoff is not None
-
-        if rate == 0:
-            messagebox.showerror("Render animation", "Rate of travel must be non-zero.", parent=self)
-            return
-        if horizon_distance <= 0:
-            messagebox.showerror("Render animation", "Distance to horizon must be greater than zero.", parent=self)
-            return
-        if not 0 <= horizon_height <= 1:
-            messagebox.showerror("Render animation", "Horizon height must be between 0 and 1.", parent=self)
+        params = self._collect_render_parameters(context="Render animation")
+        if params is None:
             return
 
-        fps = self.render_settings.fps
-        speed = abs(rate)
+        fps = max(1, int(self.render_settings.fps))
+        speed = abs(params["rate"])
         map_travel = math.hypot(
             self.map_camera_end_x - self.map_camera_start_x,
             self.map_camera_end_depth - self.map_camera_start_depth,
         )
-        duration = max(map_travel, abs(distance)) / max(speed, 1e-6)
+        duration = max(map_travel, abs(params["distance"])) / max(speed, 1e-6)
         total_frames = max(1, math.ceil(duration * fps))
         start_frame = self.render_settings.start_frame or 1
         end_frame = self.render_settings.end_frame or total_frames
@@ -1310,138 +1642,50 @@ class ParallaxPlaygroundApp(BaseTkClass):
         geometry = PerspectiveMath(
             width=self.render_settings.width,
             height=self.render_settings.height,
-            horizon_height=horizon_height,
-            horizon_distance=horizon_distance,
-            field_of_view=field_of_view,
-            foreground_cutoff=foreground_cutoff,
+            horizon_height=params["horizon_height"],
+            horizon_distance=params["horizon_distance"],
+            field_of_view=params["field_of_view"],
+            foreground_cutoff=params["foreground_cutoff"],
         )
-        horizon_y = geometry.horizon_y()
         try:
-            grid_color_rgb = ImageColor.getrgb(grid_color_raw)
+            grid_color_rgb = ImageColor.getrgb(params["grid_color_raw"])
         except ValueError:
             grid_color_rgb = ImageColor.getrgb("#0b3d0b")
 
-        try:
-            loaded_items: Dict[str, tuple[ParallaxItem, Image.Image]] = {
-                iid: (item, Image.open(item.image_path).convert("RGBA")) for iid, item in items
-            }
-        except FileNotFoundError:
-            messagebox.showerror("Render animation", "One or more image paths are missing.", parent=self)
-            return
-        except Exception as exc:  # pragma: no cover - runtime guard for unexpected image errors
-            messagebox.showerror("Render animation", f"Failed to load images: {exc}", parent=self)
+        loaded_items = self._load_render_images(items, context="Render animation")
+        if loaded_items is None:
             return
 
-        fog_start = max(0.0, horizon_distance - fog_depth)
         output_name = f"parallax_render_{int(time.time())}.mp4"
         output_path = self.project_assets_dir / output_name
         output_path.parent.mkdir(parents=True, exist_ok=True)
         writer = None
 
-        def fog_multiplier(depth: float) -> float:
-            if depth <= fog_start:
-                return 1.0
-            fog_ratio = min(1.0, (depth - fog_start) / max(fog_depth, 1e-3))
-            return 1.0 - fog_ratio * fog_amount
+        try:
+            background_rgb = ImageColor.getrgb(params["grid_background_raw"])
+        except ValueError:
+            background_rgb = ImageColor.getrgb("#050505")
 
         progress_interval = max(1, total_frames // 20)
-        horizon_x = self.render_settings.width / 2
         grid_vertical_spacing = max(8.0, self._safe_float(self.grid_vertical_spacing_var) or (self.render_settings.width / 10))
         depth_step = max(0.5, self._safe_float(self.grid_depth_spacing_var) or 10.0)
-        grid_alpha_color = (*grid_color_rgb, 140)
-
-        camera_start_x = self.map_camera_start_x or (self.map_width / 2)
-        camera_end_x = self.map_camera_end_x or camera_start_x
-        camera_start_depth = self.map_camera_start_depth
-        camera_end_depth = self.map_camera_end_depth
 
         for frame_idx in range(total_frames):
-            progress = frame_idx / max(total_frames - 1, 1)
-            camera_x = camera_start_x + (camera_end_x - camera_start_x) * progress
-            camera_depth = camera_start_depth + (camera_end_depth - camera_start_depth) * progress
-
-            frame_active: list[ActiveInstance] = []
-            for point in self.map_points:
-                if point.item_id not in loaded_items:
-                    continue
-                relative_depth = point.depth - camera_depth
-                if relative_depth <= foreground_cutoff or relative_depth >= horizon_distance + fog_depth:
-                    continue
-                visible_width = self._view_width_at_distance(relative_depth, field_of_view)
-                x_offset = point.x - camera_x
-                normalized = x_offset / max(visible_width / 2, 1e-6)
-                screen_x = (self.render_settings.width / 2) + normalized * (self.render_settings.width / 2)
-                frame_active.append(
-                    ActiveInstance(
-                        item_id=point.item_id,
-                        depth=relative_depth,
-                        x=screen_x,
-                        lateral_offset=0.0,
-                        landscape_fraction=0.5,
-                    )
-                )
-
-            frame = Image.new("RGBA", (self.render_settings.width, self.render_settings.height), "black")
-            draw: Optional[ImageDraw.ImageDraw] = None
-            if grid_enabled:
-                draw = ImageDraw.Draw(frame, "RGBA")
-                try:
-                    background_rgb = ImageColor.getrgb(grid_background_raw)
-                except ValueError:
-                    background_rgb = ImageColor.getrgb("#050505")
-                draw.rectangle([(0, horizon_y), (self.render_settings.width, self.render_settings.height)], fill=background_rgb)
-                x = 0.0
-                while x <= self.render_settings.width + 1:
-                    draw.line([(x, self.render_settings.height), (horizon_x, horizon_y)], fill=grid_alpha_color, width=1)
-                    x += grid_vertical_spacing
-
-                depth = foreground_cutoff
-                while depth <= horizon_distance:
-                    y = geometry.depth_to_screen_y(depth)
-                    if y < horizon_y:
-                        break
-                    draw.line([(0, y), (self.render_settings.width, y)], fill=grid_alpha_color, width=1)
-                    depth += depth_step
-                draw.line([(0, horizon_y), (self.render_settings.width, horizon_y)], fill=grid_alpha_color, width=1)
-            draw_list = sorted(frame_active, key=lambda inst: inst.depth, reverse=True)
-            draw_context: Optional[ImageDraw.ImageDraw] = draw if grid_enabled else None
-            for inst in draw_list:
-                item, image = loaded_items[inst.item_id]
-                scale = geometry.projected_scale(inst.depth) * max(item.scale, 0.0)
-                target_w = max(1, int(image.width * scale))
-                target_h = max(1, int(image.height * scale))
-                ground_y = geometry.depth_to_screen_y(inst.depth) + inst.lateral_offset
-                top_y = ground_y - target_h
-                top_y = max(-target_h, min(self.render_settings.height + target_h, top_y))
-                alpha = fog_multiplier(inst.depth)
-                bbox = (
-                    inst.x - target_w / 2,
-                    top_y,
-                    inst.x + target_w / 2,
-                    top_y + target_h,
-                )
-                if bbox[2] < 0 or bbox[0] > self.render_settings.width:
-                    continue
-                if bbox[3] < 0 or bbox[1] > self.render_settings.height:
-                    continue
-                if target_w < 4 or target_h < 4:
-                    if draw_context is None:
-                        draw_context = ImageDraw.Draw(frame, "RGBA")
-                    alpha_int = int(alpha * 255)
-                    shade = (40, 40, 40, alpha_int)
-                    draw_context.rectangle(
-                        [(int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3]))],
-                        fill=shade,
-                    )
-                    continue
-                scaled = image.resize((target_w, target_h), RESAMPLE)
-                if alpha < 1.0:
-                    alpha_layer = scaled.split()[3].point(lambda a: int(a * alpha))
-                    scaled.putalpha(alpha_layer)
-                frame.alpha_composite(
-                    scaled,
-                    (int(inst.x - target_w / 2), int(top_y)),
-                )
+            frame = self._compose_render_frame(
+                frame_idx,
+                total_frames,
+                geometry,
+                loaded_items,
+                grid_enabled=params["grid_enabled"],
+                grid_color_rgb=grid_color_rgb,
+                grid_background_rgb=background_rgb,
+                grid_vertical_spacing=grid_vertical_spacing,
+                depth_step=depth_step,
+                fog_amount=params["fog_amount"],
+                fog_depth=params["fog_depth"],
+                foreground_cutoff=params["foreground_cutoff"],
+                field_of_view=params["field_of_view"],
+            )
 
             if start_frame - 1 <= frame_idx <= end_frame - 1:
                 frame_rgb = frame.convert("RGB")

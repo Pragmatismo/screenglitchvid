@@ -205,6 +205,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
         self.horizon_height_var = tk.DoubleVar(value=0.5)
         self.draw_distance_var = tk.DoubleVar(value=100.0)
         self.field_of_view_var = tk.DoubleVar(value=60.0)
+        self.camera_height_var = tk.DoubleVar(value=1.0)
         self.horizon_fog_var = tk.DoubleVar(value=0.25)
         self.horizon_fog_depth_var = tk.DoubleVar(value=50.0)
         self.foreground_cutoff_var = tk.DoubleVar(value=5.0)
@@ -420,6 +421,8 @@ class ParallaxPlaygroundApp(BaseTkClass):
         ttk.Entry(settings, textvariable=self.grid_vertical_spacing_var).grid(row=6, column=3, sticky="ew", pady=4)
         ttk.Label(settings, text="Depth line spacing").grid(row=7, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(settings, textvariable=self.grid_depth_spacing_var).grid(row=7, column=1, sticky="ew", pady=4)
+        ttk.Label(settings, text="Camera height").grid(row=7, column=2, sticky="w", padx=(16, 8), pady=4)
+        ttk.Entry(settings, textvariable=self.camera_height_var).grid(row=7, column=3, sticky="ew", pady=4)
 
         self.distance_var.trace_add("write", lambda *_: self._update_duration())
         self.rate_var.trace_add("write", lambda *_: self._update_duration())
@@ -427,6 +430,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
             self.horizon_height_var,
             self.draw_distance_var,
             self.field_of_view_var,
+            self.camera_height_var,
             self.grid_vertical_spacing_var,
             self.grid_depth_spacing_var,
             self.grid_color_var,
@@ -1216,6 +1220,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
         horizon_height = self._safe_float(self.horizon_height_var)
         draw_distance = self._safe_float(self.draw_distance_var)
         field_of_view = self._safe_float(self.field_of_view_var)
+        camera_height = self._safe_float(self.camera_height_var)
         fog_amount = self._safe_float(self.horizon_fog_var)
         fog_depth = self._safe_float(self.horizon_fog_depth_var)
         foreground_cutoff = self._safe_float(self.foreground_cutoff_var)
@@ -1232,11 +1237,13 @@ class ParallaxPlaygroundApp(BaseTkClass):
             fog_depth,
             foreground_cutoff,
             field_of_view,
+            camera_height,
         }:
             messagebox.showerror(context, "Please enter numeric animation settings before rendering.", parent=self)
             return None
         assert distance is not None and rate is not None
         assert horizon_height is not None and draw_distance is not None and field_of_view is not None
+        assert camera_height is not None
         assert fog_amount is not None and fog_depth is not None and foreground_cutoff is not None
 
         if rate == 0:
@@ -1248,6 +1255,9 @@ class ParallaxPlaygroundApp(BaseTkClass):
         if not 0 <= horizon_height <= 1:
             messagebox.showerror(context, "Horizon height must be between 0 and 1.", parent=self)
             return None
+        if camera_height < 0:
+            messagebox.showerror(context, "Camera height must be zero or greater.", parent=self)
+            return None
 
         return {
             "distance": distance,
@@ -1255,6 +1265,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
             "horizon_height": horizon_height,
             "draw_distance": draw_distance,
             "field_of_view": field_of_view,
+            "camera_height": camera_height,
             "fog_amount": fog_amount,
             "fog_depth": fog_depth,
             "foreground_cutoff": foreground_cutoff,
@@ -1370,13 +1381,16 @@ class ParallaxPlaygroundApp(BaseTkClass):
         horizon_height = self._safe_float(self.horizon_height_var)
         draw_distance = self._safe_float(self.draw_distance_var)
         field_of_view = self._safe_float(self.field_of_view_var)
+        camera_height = self._safe_float(self.camera_height_var)
         foreground_cutoff = self._safe_float(self.foreground_cutoff_var) or 0.0
-        if None in {horizon_height, draw_distance, field_of_view}:
+        if None in {horizon_height, draw_distance, field_of_view, camera_height}:
             return None
         assert horizon_height is not None and draw_distance is not None and field_of_view is not None
+        assert camera_height is not None
         horizon_height = min(1.0, max(0.0, horizon_height))
         draw_distance = max(0.01, draw_distance)
         field_of_view = max(1.0, field_of_view)
+        camera_height = max(0.0, camera_height)
         return PerspectiveMath(
             width=width,
             height=height,
@@ -1384,6 +1398,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
             draw_distance=draw_distance,
             field_of_view=field_of_view,
             foreground_cutoff=max(0.0, foreground_cutoff),
+            camera_height=camera_height,
         )
 
     # ------------------------------------------------------------------
@@ -1577,6 +1592,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
             draw_distance=params["draw_distance"],
             field_of_view=params["field_of_view"],
             foreground_cutoff=params["foreground_cutoff"],
+            camera_height=params["camera_height"],
         )
 
         loaded_items = self._load_render_images(list(self.items.items()), context="Preview frame")
@@ -1923,6 +1939,7 @@ class ParallaxPlaygroundApp(BaseTkClass):
             draw_distance=params["draw_distance"],
             field_of_view=params["field_of_view"],
             foreground_cutoff=params["foreground_cutoff"],
+            camera_height=params["camera_height"],
         )
         try:
             grid_color_rgb = ImageColor.getrgb(params["grid_color_raw"])
